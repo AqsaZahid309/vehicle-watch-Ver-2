@@ -52,7 +52,7 @@ async def user_from_token(token: str, db: AsyncSession) -> User:
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
 ) -> User:
     if not credentials:
         raise UnauthorizedError("Bearer token missing")
@@ -61,7 +61,7 @@ async def get_current_user(
 
 async def get_optional_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
 ) -> User | None:
     if not credentials:
         return None
@@ -93,7 +93,7 @@ WRITE_ROLES = {UserRole.ADMIN, UserRole.MANAGER, UserRole.TECHNICIAN, UserRole.O
 
 async def get_device_from_api_key(
     x_device_key: str | None = Header(default=None, alias="X-Device-Key"),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
 ) -> Device | None:
     """Resolve the device behind an `X-Device-Key` header, or None if no header was sent."""
     if not x_device_key:

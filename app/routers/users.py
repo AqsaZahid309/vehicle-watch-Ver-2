@@ -16,14 +16,14 @@ router = APIRouter(tags=["Users & Organization"])
 
 @router.get("/users", response_model=list[UserRead])
 async def list_users(
-    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
+    db: AsyncSession = Depends(get_db, scope="function"), current_user: User = Depends(get_current_user)
 ) -> list[UserRead]:
     return [UserRead.model_validate(u) for u in await UserService(db).list_users(current_user)]
 
 
 @router.post("/users", response_model=UserRead, status_code=status.HTTP_201_CREATED)
 async def create_user(
-    data: UserCreate, db: AsyncSession = Depends(get_db), admin: User = Depends(require_admin)
+    data: UserCreate, db: AsyncSession = Depends(get_db, scope="function"), admin: User = Depends(require_admin)
 ) -> UserRead:
     """Add a teammate to your organization with a chosen role."""
     return UserRead.model_validate(await UserService(db).create(data, admin))
@@ -32,28 +32,28 @@ async def create_user(
 @router.patch("/users/{user_id}", response_model=UserRead)
 async def update_user(
     user_id: uuid.UUID, data: UserUpdate,
-    db: AsyncSession = Depends(get_db), admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db, scope="function"), admin: User = Depends(require_admin),
 ) -> UserRead:
     return UserRead.model_validate(await UserService(db).update(user_id, data, admin))
 
 
 @router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user(
-    user_id: uuid.UUID, db: AsyncSession = Depends(get_db), admin: User = Depends(require_admin)
+    user_id: uuid.UUID, db: AsyncSession = Depends(get_db, scope="function"), admin: User = Depends(require_admin)
 ) -> None:
     await UserService(db).delete(user_id, admin)
 
 
 @router.get("/organization", response_model=OrganizationRead)
 async def get_organization(
-    db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
+    db: AsyncSession = Depends(get_db, scope="function"), current_user: User = Depends(get_current_user)
 ) -> OrganizationRead:
     return OrganizationRead.model_validate(await UserService(db).get_org(current_user))
 
 
 @router.patch("/organization", response_model=OrganizationRead)
 async def update_organization(
-    data: OrganizationUpdate, db: AsyncSession = Depends(get_db), admin: User = Depends(require_admin)
+    data: OrganizationUpdate, db: AsyncSession = Depends(get_db, scope="function"), admin: User = Depends(require_admin)
 ) -> OrganizationRead:
     return OrganizationRead.model_validate(await UserService(db).update_org(data, admin))
 
@@ -61,7 +61,7 @@ async def update_organization(
 @router.get("/audit-logs")
 async def list_audit_logs(
     limit: int = Query(default=100, ge=1, le=500),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> list[dict]:
     rows = (

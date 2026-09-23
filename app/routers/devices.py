@@ -19,7 +19,7 @@ router = APIRouter(prefix="/devices", tags=["Devices"])
 @router.post("", response_model=DeviceRead, status_code=status.HTTP_201_CREATED)
 async def create_device(
     data: DeviceCreate,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     manager: User = Depends(require_manager),
 ) -> DeviceRead:
@@ -29,7 +29,7 @@ async def create_device(
 
 @router.get("", response_model=list[DeviceRead])
 async def list_devices(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     current_user: User = Depends(get_current_user),
 ) -> list[DeviceRead]:
@@ -39,7 +39,7 @@ async def list_devices(
 
 @router.get("/live", response_model=list[LiveDevice])
 async def live_devices(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     current_user: User = Depends(get_current_user),
 ) -> list[LiveDevice]:
@@ -50,7 +50,7 @@ async def live_devices(
 @router.get("/{device_id}", response_model=DeviceRead)
 async def get_device(
     device_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     current_user: User = Depends(get_current_user),
 ) -> DeviceRead:
@@ -62,7 +62,7 @@ async def get_device(
 async def update_device(
     device_id: uuid.UUID,
     data: DeviceUpdate,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     manager: User = Depends(require_manager),
 ) -> DeviceRead:
@@ -73,7 +73,7 @@ async def update_device(
 @router.get("/{device_id}/status", response_model=DeviceStatusResponse)
 async def get_device_status(
     device_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     current_user: User = Depends(get_current_user),
 ) -> DeviceStatusResponse:
@@ -83,7 +83,7 @@ async def get_device_status(
 @router.post("/{device_id}/api-key", response_model=DeviceApiKeyResponse)
 async def rotate_api_key(
     device_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     manager: User = Depends(require_manager),
 ) -> DeviceApiKeyResponse:
@@ -98,7 +98,7 @@ async def rotate_api_key(
 @router.delete("/{device_id}/api-key", status_code=status.HTTP_204_NO_CONTENT)
 async def revoke_api_key(
     device_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     manager: User = Depends(require_manager),
 ) -> None:
@@ -108,7 +108,7 @@ async def revoke_api_key(
 @router.delete("/{device_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_device(
     device_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     admin: User = Depends(require_admin),
 ) -> None:

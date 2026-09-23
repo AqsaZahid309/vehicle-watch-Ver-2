@@ -38,6 +38,7 @@ import httpx
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | SIM | %(message)s")
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 API = "/api/v1"
 DEPOT = (51.5150, -0.2000)

@@ -32,7 +32,7 @@ def _range(start: datetime | None, end: datetime | None) -> tuple[datetime, date
 async def report_summary(
     start: datetime | None = Query(default=None),
     end: datetime | None = Query(default=None),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Fleet KPIs, alert quality, maintenance cost/downtime and estimated cost avoided for a period."""
@@ -46,7 +46,7 @@ async def export_csv(
     start: datetime | None = Query(default=None),
     end: datetime | None = Query(default=None),
     device_id: uuid.UUID | None = Query(default=None),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     user: User = Depends(get_current_user),
 ) -> Response:
     if kind not in _EXPORTS:

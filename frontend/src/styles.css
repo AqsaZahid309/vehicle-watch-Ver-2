@@ -293,6 +293,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .map { height: 420px; border-radius: 0 0 var(--radius) var(--radius); z-index: 0; }
 .map.tall { height: calc(100vh - 190px); min-height: 460px; border-radius: var(--radius); }
 .leaflet-container { font-family: var(--font); background: var(--surface-2); }
+:root[data-theme="dark"] .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.9) contrast(0.9) saturate(0.6); }
 :root[data-theme="dark"] .leaflet-popup-content-wrapper, :root[data-theme="dark"] .leaflet-popup-tip { background: var(--surface); color: var(--text); }
 
 .auth-page { min-height: 100vh; display: grid; grid-template-columns: 1fr 1fr; }

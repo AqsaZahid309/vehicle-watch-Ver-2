@@ -12,6 +12,12 @@ Method (deliberately simple and explainable):
   3. Fit a straight line (least squares) through the bucket medians.
   4. If the slope points toward the threshold and the fit is good (R² ≥ 0.5),
      hours_to_threshold = (threshold − current) / slope.
+
+Guards against over-confident projections:
+  • at least MIN_SPAN_HOURS of history is required — the first minutes after a
+    cold start (engine warming up, truck pulling away) are not a trend;
+  • a projection may reach at most EXTRAPOLATION_FACTOR × the observed span
+    into the future.
 """
 
 import uuid
@@ -28,8 +34,10 @@ from app.models.telemetry import Telemetry
 from app.schemas.ml import DeviceForecast, ForecastSignal
 
 FORECAST_WINDOW_HOURS = 6.0
-MAX_POINTS = 3000
+MAX_POINTS = 8000
 MIN_POINTS = 30
+MIN_SPAN_HOURS = 0.75
+EXTRAPOLATION_FACTOR = 8.0
 BUCKETS = 24
 MIN_R2 = 0.5
 HORIZON_HOURS = 24 * 30
@@ -102,11 +110,14 @@ def forecast_signal(spec: SignalSpec, hours: np.ndarray, values: np.ndarray) -> 
 
     toward = slope > 0 if spec.direction == "rising" else slope < 0
     past = current >= spec.threshold if spec.direction == "rising" else current <= spec.threshold
+    enough_history = span >= MIN_SPAN_HOURS
     hours_to: float | None = None
-    if not past and toward and r2 >= MIN_R2 and abs(slope) > 1e-9:
+    if enough_history and not past and toward and r2 >= MIN_R2 and abs(slope) > 1e-9:
         h = (spec.threshold - current) / slope
-        if 0 < h <= HORIZON_HOURS:
-            hours_to = round(h, 1)
+        if 0 < h <= min(HORIZON_HOURS, EXTRAPOLATION_FACTOR * span):
+            hours_to = max(0.1, round(h, 1))
+    # "Already past" needs the recent fit to agree with sustained history, not a single spike.
+    past = past and enough_history
 
     return ForecastSignal(
         signal=spec.signal,
@@ -130,16 +141,15 @@ class ForecastService:
 
     async def forecast_device(self, device: Device) -> DeviceForecast:
         since = utcnow() - timedelta(hours=FORECAST_WINDOW_HOURS)
-        rows = list(
-            (
-                await self._db.execute(
-                    select(Telemetry)
-                    .where(Telemetry.device_id == device.id, Telemetry.recorded_at >= since)
-                    .order_by(Telemetry.recorded_at.desc())
-                    .limit(MAX_POINTS)
-                )
-            ).scalars().all()
-        )
+        cols = [Telemetry.recorded_at] + [getattr(Telemetry, s.signal) for s in SIGNALS]
+        rows = (
+            await self._db.execute(
+                select(*cols)
+                .where(Telemetry.device_id == device.id, Telemetry.recorded_at >= since)
+                .order_by(Telemetry.recorded_at.desc())
+                .limit(MAX_POINTS)
+            )
+        ).all()
         base = DeviceForecast(
             device_id=device.id, device_name=device.name, sample_count=len(rows),
             window_hours=0.0, overall_risk="NONE", min_hours_to_failure=None, signals=[],

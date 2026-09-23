@@ -22,7 +22,7 @@ _FLEET_FORECAST_CACHE_TTL = 60
 
 @router.get("/fleet")
 async def fleet_summary(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     return await AnalyticsService(db).fleet_summary(current_user)
@@ -31,7 +31,7 @@ async def fleet_summary(
 @router.get("/timeline")
 async def alert_timeline(
     days: int = Query(default=7, ge=1, le=90),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     return await AnalyticsService(db).alert_timeline(current_user, days)
@@ -39,7 +39,7 @@ async def alert_timeline(
 
 @router.get("/forecast", response_model=list[DeviceForecast])
 async def fleet_forecast(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     current_user: User = Depends(get_current_user),
 ) -> list[DeviceForecast]:
@@ -64,7 +64,7 @@ async def fleet_forecast(
 async def device_trends(
     device_id: uuid.UUID,
     last_n: int = Query(default=100, ge=10, le=2000),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     return await AnalyticsService(db).device_trends(device_id, current_user, last_n)
@@ -74,7 +74,7 @@ async def device_trends(
 async def device_hourly(
     device_id: uuid.UUID,
     hours: int = Query(default=72, ge=1, le=24 * 90),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     return await AnalyticsService(db).device_hourly(device_id, current_user, hours)
@@ -83,7 +83,7 @@ async def device_hourly(
 @router.get("/devices/{device_id}/forecast", response_model=DeviceForecast)
 async def device_forecast(
     device_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(get_current_user),
 ) -> DeviceForecast:
     """Remaining-useful-life projection for each health signal of one vehicle."""

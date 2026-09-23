@@ -232,3 +232,29 @@ async def test_health_metrics_and_security_headers(client: AsyncClient) -> None:
 async def test_unknown_api_route_is_json_404(client: AsyncClient) -> None:
     resp = await client.get("/api/v1/does-not-exist")
     assert resp.status_code == 404
+
+
+def test_every_db_dependency_commits_before_the_response() -> None:
+    """
+    Regression guard: `get_db` commits after `yield`. With FastAPI's default
+    ("request") dependency scope that commit runs after the response is sent, so
+    a client could see 201 for a row that isn't visible yet. Every route must use
+    `Depends(get_db, scope="function")`.
+    """
+    from fastapi.routing import APIRoute
+
+    from app.database import get_db
+    from app.main import app
+
+    offenders: list[str] = []
+
+    def walk(dependant, path: str) -> None:
+        for dep in dependant.dependencies:
+            if dep.call is get_db and getattr(dep, "scope", None) != "function":
+                offenders.append(path)
+            walk(dep, path)
+
+    for route in app.routes:
+        if isinstance(route, APIRoute):
+            walk(route.dependant, f"{sorted(route.methods)} {route.path}")
+    assert not offenders, offenders

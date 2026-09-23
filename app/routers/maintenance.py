@@ -43,7 +43,7 @@ async def list_work_orders(
     assigned_to_me: bool = Query(default=False),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(get_current_user),
 ) -> PaginatedWorkOrders:
     """status: OPEN | IN_PROGRESS | ON_HOLD | RESOLVED | CANCELLED | OPEN_ANY (all unresolved)."""
@@ -54,7 +54,7 @@ async def list_work_orders(
 async def create_work_order(
     data: WorkOrderCreate,
     background: BackgroundTasks,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     current_user: User = Depends(require_operator),
 ) -> WorkOrderRead:
@@ -70,7 +70,7 @@ async def create_work_order(
 @router.get("/work-orders/{wo_id}", response_model=WorkOrderRead)
 async def get_work_order(
     wo_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(get_current_user),
 ) -> WorkOrderRead:
     return await MaintenanceService(db).get(wo_id, current_user)
@@ -81,7 +81,7 @@ async def update_work_order(
     wo_id: uuid.UUID,
     data: WorkOrderUpdate,
     background: BackgroundTasks,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     current_user: User = Depends(require_technician),
 ) -> WorkOrderRead:
@@ -98,7 +98,7 @@ async def update_work_order(
 @router.delete("/work-orders/{wo_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_work_order(
     wo_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(require_manager),
 ) -> None:
     await MaintenanceService(db).delete(wo_id, current_user)
@@ -107,7 +107,7 @@ async def delete_work_order(
 @router.get("/schedules", response_model=list[ServiceScheduleRead])
 async def list_schedules(
     device_id: uuid.UUID | None = Query(default=None),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(get_current_user),
 ) -> list[ServiceScheduleRead]:
     return await MaintenanceService(db).list_schedules(current_user, device_id)
@@ -116,7 +116,7 @@ async def list_schedules(
 @router.post("/schedules", response_model=ServiceScheduleRead, status_code=status.HTTP_201_CREATED)
 async def create_schedule(
     data: ServiceScheduleCreate,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(require_manager),
 ) -> ServiceScheduleRead:
     return await MaintenanceService(db).create_schedule(data, current_user)
@@ -126,7 +126,7 @@ async def create_schedule(
 async def update_schedule(
     schedule_id: uuid.UUID,
     data: ServiceScheduleUpdate,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(require_manager),
 ) -> ServiceScheduleRead:
     return await MaintenanceService(db).update_schedule(schedule_id, data, current_user)
@@ -135,7 +135,7 @@ async def update_schedule(
 @router.delete("/schedules/{schedule_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_schedule(
     schedule_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(require_manager),
 ) -> None:
     await MaintenanceService(db).delete_schedule(schedule_id, current_user)

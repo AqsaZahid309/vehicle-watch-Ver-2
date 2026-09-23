@@ -33,6 +33,14 @@ class Base(DeclarativeBase):
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Request-scoped session that commits on success.
+
+    Always declare it as `Depends(get_db, scope="function")`: with the default
+    ("request") scope FastAPI runs the code after `yield` — the commit — only
+    *after* the response has been sent, so a client could receive 201 for a
+    write that is not yet visible (or that then fails to commit).
+    """
     async with AsyncSessionLocal() as session:
         try:
             yield session

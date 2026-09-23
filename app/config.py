@@ -65,7 +65,7 @@ class Settings(BaseSettings):
 
     # Anomaly detection
     anomaly_training_samples: int = 300
-    anomaly_min_training_samples: int = 10
+    anomaly_min_training_samples: int = 30
     anomaly_retrain_min_new_records: int = 300
     anomaly_retrain_min_interval_minutes: int = 60
     anomaly_drift_psi_threshold: float = 0.25

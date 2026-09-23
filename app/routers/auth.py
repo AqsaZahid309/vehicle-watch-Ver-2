@@ -28,7 +28,7 @@ def _client_ip(request: Request) -> str:
 async def register(
     data: RegisterRequest,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
 ) -> UserRead:
     """Create a new organization with the caller as its ADMIN."""
@@ -43,7 +43,7 @@ async def register(
 async def login(
     data: LoginRequest,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
 ) -> TokenResponse:
     await check_login_rate_limit(f"{_client_ip(request)}:{data.email.lower()}", redis)
@@ -51,14 +51,14 @@ async def login(
 
 
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh(data: RefreshRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+async def refresh(data: RefreshRequest, db: AsyncSession = Depends(get_db, scope="function")) -> TokenResponse:
     return await AuthService(db).refresh(data.refresh_token)
 
 
 @router.get("/me", response_model=MeResponse)
 async def get_me(
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
 ) -> MeResponse:
     """The authenticated user's profile and organization."""
     org = await db.get(Organization, current_user.organization_id)
@@ -72,6 +72,6 @@ async def get_me(
 async def change_password(
     data: PasswordChange,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
 ) -> None:
     await AuthService(db).change_password(current_user, data.current_password, data.new_password)

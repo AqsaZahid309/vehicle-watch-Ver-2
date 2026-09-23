@@ -69,7 +69,7 @@ class Alert(Base):
     # Rule-based fault classification (populated by fault_classifier() in anomaly_service).
     # Nullable so that alerts created before this feature was added remain valid.
     fault_type: Mapped[FaultType | None] = mapped_column(
-        SAEnum(FaultType, name="faulttype"), nullable=True
+        SAEnum(FaultType, name="faulttype"), nullable=True, index=True
     )
     fault_confidence: Mapped[FaultConfidence | None] = mapped_column(
         SAEnum(FaultConfidence, name="faultconfidence"), nullable=True

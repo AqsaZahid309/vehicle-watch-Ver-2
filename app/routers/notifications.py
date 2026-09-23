@@ -22,7 +22,7 @@ router = APIRouter(prefix="/notifications", tags=["Notifications"])
 async def list_notifications(
     unread_only: bool = Query(default=False),
     limit: int = Query(default=50, ge=1, le=200),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     user: User = Depends(get_current_user),
 ) -> NotificationList:
     base = [Notification.organization_id == user.organization_id]
@@ -37,7 +37,7 @@ async def list_notifications(
 
 
 @router.post("/read-all", status_code=status.HTTP_204_NO_CONTENT)
-async def mark_all_read(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)) -> None:
+async def mark_all_read(db: AsyncSession = Depends(get_db, scope="function"), user: User = Depends(get_current_user)) -> None:
     await db.execute(
         update(Notification)
         .where(Notification.organization_id == user.organization_id, Notification.read.is_(False))
@@ -48,7 +48,7 @@ async def mark_all_read(db: AsyncSession = Depends(get_db), user: User = Depends
 
 @router.post("/{notification_id}/read", status_code=status.HTTP_204_NO_CONTENT)
 async def mark_read(
-    notification_id: uuid.UUID, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)
+    notification_id: uuid.UUID, db: AsyncSession = Depends(get_db, scope="function"), user: User = Depends(get_current_user)
 ) -> None:
     await db.execute(
         update(Notification)
@@ -74,7 +74,7 @@ async def _channel(db: AsyncSession, channel_id: uuid.UUID, user: User) -> Notif
 
 
 @router.get("/channels", response_model=list[ChannelRead])
-async def list_channels(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+async def list_channels(db: AsyncSession = Depends(get_db, scope="function"), user: User = Depends(get_current_user)):
     rows = (
         await db.execute(
             select(NotificationChannel)
@@ -86,7 +86,7 @@ async def list_channels(db: AsyncSession = Depends(get_db), user: User = Depends
 
 
 @router.post("/channels", response_model=ChannelRead, status_code=status.HTTP_201_CREATED)
-async def create_channel(data: ChannelCreate, db: AsyncSession = Depends(get_db), admin: User = Depends(require_admin)):
+async def create_channel(data: ChannelCreate, db: AsyncSession = Depends(get_db, scope="function"), admin: User = Depends(require_admin)):
     ch = NotificationChannel(
         organization_id=admin.organization_id,
         name=data.name,
@@ -106,7 +106,7 @@ async def create_channel(data: ChannelCreate, db: AsyncSession = Depends(get_db)
 
 @router.patch("/channels/{channel_id}", response_model=ChannelRead)
 async def update_channel(
-    channel_id: uuid.UUID, data: ChannelUpdate, db: AsyncSession = Depends(get_db), admin: User = Depends(require_admin)
+    channel_id: uuid.UUID, data: ChannelUpdate, db: AsyncSession = Depends(get_db, scope="function"), admin: User = Depends(require_admin)
 ):
     ch = await _channel(db, channel_id, admin)
     changes = data.model_dump(exclude_unset=True)
@@ -125,14 +125,14 @@ async def update_channel(
 
 
 @router.delete("/channels/{channel_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_channel(channel_id: uuid.UUID, db: AsyncSession = Depends(get_db), admin: User = Depends(require_admin)):
+async def delete_channel(channel_id: uuid.UUID, db: AsyncSession = Depends(get_db, scope="function"), admin: User = Depends(require_admin)):
     ch = await _channel(db, channel_id, admin)
     record_audit(db, admin, "channel.deleted", "notification_channel", ch.id, {"name": ch.name})
     await db.delete(ch)
 
 
 @router.post("/channels/{channel_id}/test")
-async def test_channel(channel_id: uuid.UUID, db: AsyncSession = Depends(get_db), admin: User = Depends(require_admin)):
+async def test_channel(channel_id: uuid.UUID, db: AsyncSession = Depends(get_db, scope="function"), admin: User = Depends(require_admin)):
     """Send a test message through the channel and report success or the delivery error."""
     ch = await _channel(db, channel_id, admin)
     probe = Notification(
@@ -150,7 +150,7 @@ async def test_channel(channel_id: uuid.UUID, db: AsyncSession = Depends(get_db)
 @router.get("/deliveries", response_model=list[DeliveryRead])
 async def list_deliveries(
     limit: int = Query(default=100, ge=1, le=500),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ):
     rows = (

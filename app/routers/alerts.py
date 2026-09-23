@@ -29,7 +29,7 @@ async def list_alerts(
     end: datetime | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(get_current_user),
 ) -> PaginatedAlerts:
     return await AlertService(db).list_alerts(
@@ -40,7 +40,7 @@ async def list_alerts(
 @router.post("/acknowledge", response_model=dict)
 async def bulk_acknowledge(
     data: BulkAcknowledge,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     current_user: User = Depends(require_operator),
 ) -> dict:
@@ -51,7 +51,7 @@ async def bulk_acknowledge(
 @router.get("/{alert_id}", response_model=AlertDetail)
 async def get_alert(
     alert_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(get_current_user),
 ) -> AlertDetail:
     return await AlertService(db).get_detail(alert_id, current_user)
@@ -63,7 +63,7 @@ async def acknowledge_alert(
     # Body(default_factory=...) makes the request body optional — clients can send an
     # empty body or omit it entirely. Send {"acknowledged": false} to reopen an alert.
     body: AlertAcknowledge = Body(default_factory=AlertAcknowledge),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     current_user: User = Depends(require_operator),
 ) -> AlertRead:
@@ -75,7 +75,7 @@ async def acknowledge_alert(
 async def alert_feedback(
     alert_id: uuid.UUID,
     data: AlertFeedbackIn,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     current_user: User = Depends(require_operator),
 ) -> AlertRead:
     """Label an alert as a true or false positive — feeds the detector precision metrics."""

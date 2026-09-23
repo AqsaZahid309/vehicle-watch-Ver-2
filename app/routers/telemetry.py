@@ -45,7 +45,7 @@ def _resolve_writer(
 async def ingest_telemetry(
     device_id: uuid.UUID,
     data: TelemetryCreate,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     key_device: Device | None = Depends(get_device_from_api_key),
     user: User | None = Depends(get_optional_user),
@@ -68,7 +68,7 @@ async def ingest_telemetry(
 async def ingest_telemetry_batch(
     device_id: uuid.UUID,
     batch: TelemetryBatch,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     key_device: Device | None = Depends(get_device_from_api_key),
     user: User | None = Depends(get_optional_user),
@@ -85,7 +85,7 @@ async def ingest_telemetry_batch(
 @router.post("/ingest/telemetry", response_model=TelemetryRead, status_code=status.HTTP_201_CREATED)
 async def device_ingest(
     data: TelemetryCreate,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     device: Device | None = Depends(get_device_from_api_key),
 ) -> TelemetryRead:
@@ -99,7 +99,7 @@ async def device_ingest(
 @router.post("/ingest/telemetry/batch", response_model=BatchIngestResponse, status_code=status.HTTP_201_CREATED)
 async def device_ingest_batch(
     batch: TelemetryBatch,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     device: Device | None = Depends(get_device_from_api_key),
 ) -> BatchIngestResponse:
@@ -116,7 +116,7 @@ async def get_telemetry_history(
     page_size: int = Query(default=50, ge=1, le=1000),
     start: datetime | None = Query(default=None),
     end: datetime | None = Query(default=None),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     redis: aioredis.Redis = Depends(get_redis),
     current_user: User = Depends(get_current_user),
 ) -> PaginatedTelemetry:

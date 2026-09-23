@@ -9,11 +9,12 @@ const KIND_COLOR: Record<string, string> = { DEPOT: "#2563eb", CUSTOMER: "#16a34
 const DEFAULT_CENTER: [number, number] = [51.5074, -0.1278];
 
 function Tiles() {
-  const dark = document.documentElement.dataset.theme === "dark";
+  // Standard OpenStreetMap tiles (no API key). Dark mode inverts them in CSS.
   return (
     <TileLayer
-      attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
-      url={`https://{s}.basemaps.cartocdn.com/${dark ? "dark_all" : "light_all"}/{z}/{x}/{y}{r}.png`}
+      attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+      url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+      maxZoom={19}
     />
   );
 }

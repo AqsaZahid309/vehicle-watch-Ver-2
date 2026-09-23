@@ -57,7 +57,11 @@ export default function Overview() {
                 <div className="small muted">
                   {top.label} {top.direction === "rising" ? "↑" : "↓"} {num(top.current, 2)} {top.unit} → limit {top.threshold} {top.unit}
                 </div>
-                <div className="small">Predicted {humanize(top.predicted_fault)} in <strong>{hoursLabel(top.hours_to_threshold)}</strong></div>
+                <div className="small">
+                  {top.hours_to_threshold === 0
+                    ? <>Limit crossed — likely <strong>{humanize(top.predicted_fault)}</strong></>
+                    : <>Predicted {humanize(top.predicted_fault)} in <strong>{hoursLabel(top.hours_to_threshold)}</strong></>}
+                </div>
               </Link>
             );
           })}
