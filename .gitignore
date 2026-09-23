@@ -1,0 +1,12 @@
+.env
+*.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+.coverage
+.pytest_cache/
+node_modules/
+frontend/dist/
+app/static/app/
