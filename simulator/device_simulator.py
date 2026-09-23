@@ -1,547 +1,388 @@
 """
-VehicleWatch Device Simulator — 5 Unique Fault Personalities
+VehicleWatch Fleet Simulator
 
-Each vehicle is a stateful class. Degradation accumulates across readings,
-not randomly per reading. All 5 vehicles run concurrently via asyncio.
+Drives five trucks around London with realistic physics (smooth acceleration,
+stops at customer sites, fuel burn proportional to distance) and five distinct
+fault personalities. Each vehicle authenticates with its own device API key,
+and one of them periodically loses coverage, buffers readings and uploads them
+as a batch — exercising the offline backfill path.
+
+On first run the simulator also sets up the organization: drivers, geofences
+(depot, customers, a restricted zone with a speed limit) and a preventive
+maintenance schedule.
 
 Usage:
     python simulator/device_simulator.py
-    python simulator/device_simulator.py --host http://localhost:8000 --devices 3
-    python simulator/device_simulator.py --email admin@example.com --password secret
+    python simulator/device_simulator.py --host http://localhost:8000 --devices 3 --interval 1
 
-Vehicles (in order):
-    1. Truck-Alpha  — healthy baseline (control vehicle, no faults)
-    2. Truck-Beta   — developing coolant leak (engine_temp rising curve)
-    3. Truck-Gamma  — battery / alternator degradation (voltage drop + erratic RPM)
-    4. Truck-Delta  — transmission stress (RPM spikes at high speed)
-    5. Truck-Echo   — brake wear / wheel bearing (vibration scales with speed)
+Vehicles:
+    1. Truck-Alpha  — healthy baseline (control), careful driver
+    2. Truck-Beta   — developing coolant leak: temperature climbs, coolant level falls, DTC P0217
+    3. Truck-Gamma  — battery/alternator degradation: voltage falls steadily, DTC P0562, erratic RPM
+    4. Truck-Delta  — transmission slip at speed (DTC P0730), aggressive driver, fuel-theft stops,
+                      route crosses the restricted zone
+    5. Truck-Echo   — wheel bearing: vibration rises with speed (DTC C0040); drives through
+                      dead zones and backfills buffered readings
 """
 
-import abc
 import argparse
 import asyncio
 import logging
+import math
 import random
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | SIMULATOR | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | SIM | %(message)s")
 logger = logging.getLogger(__name__)
 
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def _rand(lo: float, hi: float, decimals: int = 3) -> float:
-    return round(random.uniform(lo, hi), decimals)
-
-
-def _clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
-
-
-def _gps() -> tuple[float, float]:
-    """Random US-continental GPS coordinate."""
-    return _rand(30.0, 48.0, 6), _rand(-120.0, -75.0, 6)
+API = "/api/v1"
+DEPOT = (51.5150, -0.2000)
+CUSTOMERS = {
+    "Canary Wharf DC": (51.5054, -0.0235),
+    "Heathrow Cargo": (51.4730, -0.4540),
+    "Wembley Retail": (51.5560, -0.2795),
+    "Croydon Hub": (51.3762, -0.0982),
+    "Stratford Yard": (51.5430, -0.0030),
+}
+RESTRICTED = ("City Low-Speed Zone", (51.5155, -0.0920), 1800.0, 30.0)  # name, centre, radius m, limit km/h
+KM_PER_DEG_LAT = 111.32
 
 
-# ── Base vehicle ─────────────────────────────────────────────────────────────
-
-class BaseVehicle(abc.ABC):
-    """
-    Abstract base for all simulated vehicles.
-
-    Subclasses implement `_build_telemetry()` which returns all non-GPS fields.
-    State (degradation counters, baselines) lives in the instance and persists
-    across every reading for the lifetime of the simulation run.
-
-    `generate_reading()` is the public API — it increments the counter,
-    attaches GPS, and returns the full payload dict ready to POST.
-    """
-
-    name:        str = "BaseVehicle"
-    device_type: str = "truck"
-
-    def __init__(self) -> None:
-        self.reading_count: int = 0
-
-    def generate_reading(self) -> dict[str, Any]:
-        """Increment counter, build telemetry, attach GPS. Returns full payload."""
-        self.reading_count += 1
-        lat, lon = _gps()
-        payload = self._build_telemetry()
-        payload["gps_lat"] = lat
-        payload["gps_lon"] = lon
-        return payload
-
-    @abc.abstractmethod
-    def _build_telemetry(self) -> dict[str, Any]:
-        """Return dict of all non-GPS sensor fields for this reading."""
-        ...
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
 
-# ── Vehicle 1 — Truck-Alpha (healthy baseline / control vehicle) ─────────────
+def _km_between(a: tuple[float, float], b: tuple[float, float]) -> float:
+    dlat = (b[0] - a[0]) * KM_PER_DEG_LAT
+    dlon = (b[1] - a[1]) * KM_PER_DEG_LAT * math.cos(math.radians(a[0]))
+    return math.hypot(dlat, dlon)
 
-class TruckAlpha(BaseVehicle):
-    """
-    All sensor readings stay within normal ranges for the entire run.
-    No anomalies, no degradation. Provides the ML model with clean baseline
-    data and acts as the control vehicle for anomaly comparison.
 
-    Normal ranges:
-        engine_temp:     75–95 °C
-        rpm:             800–2500
-        fuel_level:      30–95 %
-        battery_voltage: 12.8–14.2 V
-        speed:           0–100 km/h
-        vibration:       0.5–2.5
-    """
-
-    name        = "Truck-Alpha"
+class Vehicle:
+    name = "Vehicle"
     device_type = "truck"
-
-    def _build_telemetry(self) -> dict[str, Any]:
-        return {
-            "engine_temp":     _rand(75.0,  95.0,  2),
-            "rpm":             _rand(800.0, 2500.0, 1),
-            "fuel_level":      _rand(30.0,  95.0,  2),
-            "battery_voltage": _rand(12.8,  14.2,  3),
-            "speed":           _rand(0.0,   100.0, 2),
-            "vibration":       _rand(0.5,   2.5,   3),
-        }
-
-
-# ── Vehicle 2 — Truck-Beta (developing coolant leak) ─────────────────────────
-
-class TruckBeta(BaseVehicle):
-    """
-    Engine temperature rises on a deterministic degradation curve, simulating
-    a slow coolant leak that causes progressive overheating.
-
-    Degradation schedule:
-        Every 20 readings  → _temp_offset += 4 °C
-        After 100 readings → _temp_offset = +20 °C
-        engine_temp base (95 °C) + 20 °C offset = 115 °C consistently
-
-    Vibration rises in proportion to the thermal offset because an overheating
-    engine produces additional mechanical vibration (expansion, knock).
-
-    Fault label logged: COOLANT_LEAK
-    """
-
-    name        = "Truck-Beta"
-    device_type = "truck"
-
-    _STEP_EVERY: int   = 20   # readings between degradation increments
-    _STEP_DEG:   float = 4.0  # °C gained per step
-    _FAULT_ABOVE: float = 105.0  # °C threshold for logging the fault
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._temp_offset: float = 0.0  # cumulative °C added to baseline
-
-    def _build_telemetry(self) -> dict[str, Any]:
-        # Advance degradation: fires at readings 20, 40, 60, 80, 100, …
-        if self.reading_count % self._STEP_EVERY == 0:
-            self._temp_offset += self._STEP_DEG
-
-        engine_temp = round(
-            _clamp(95.0 + self._temp_offset + random.uniform(-3.0, 3.0), 40.0, 160.0), 2
-        )
-
-        # Vibration coupled to thermal stress: +0.05 per degree of offset
-        vibration = round(
-            _clamp(0.8 + self._temp_offset * 0.05 + random.uniform(-0.2, 0.4), 0.1, 10.0), 3
-        )
-
-        if engine_temp > self._FAULT_ABOVE:
-            logger.warning(
-                "[%s] COOLANT_LEAK anomaly injected — engine_temp: %.1f°C "
-                "(offset: +%.1f°C, reading #%d)",
-                self.name, engine_temp, self._temp_offset, self.reading_count,
-            )
-
-        return {
-            "engine_temp":     engine_temp,
-            "rpm":             _rand(800.0, 2500.0, 1),
-            "fuel_level":      _rand(30.0,  90.0,  2),
-            "battery_voltage": _rand(12.8,  14.2,  3),
-            "speed":           _rand(0.0,   100.0, 2),
-            "vibration":       vibration,
-        }
-
-
-# ── Vehicle 3 — Truck-Gamma (battery / alternator degradation) ───────────────
-
-class TruckGamma(BaseVehicle):
-    """
-    Battery voltage drops steadily, simulating a failing alternator or cell
-    degradation. Once voltage falls below 11.8 V, the engine control module
-    receives unstable power causing erratic RPM fluctuations.
-
-    Degradation schedule:
-        Every 15 readings  → _voltage_base -= 0.05 V
-        Start: 13.8 V  →  erratic threshold (11.8 V) reached after ~600 readings
-        At 2-second intervals that is ~20 minutes — realistic for a slow drain.
-
-    Below 11.8 V:
-        RPM base ± 500 RPM noise (simulates ECM instability under low voltage)
-
-    Fault label logged: BATTERY_DEGRADATION
-    """
-
-    name        = "Truck-Gamma"
-    device_type = "truck"
-
-    _STEP_EVERY:        int   = 15
-    _STEP_VOLT:         float = 0.05
-    _ERRATIC_THRESHOLD: float = 11.8   # V — below this, RPM becomes unstable
-    _RPM_ERRATIC_SWING: float = 500.0  # ± RPM noise
-    _VOLTAGE_FLOOR:     float = 8.0    # V — dead battery floor
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._voltage_base: float = 13.8
-
-    def _build_telemetry(self) -> dict[str, Any]:
-        # Advance degradation: first decrement at reading 15
-        if self.reading_count % self._STEP_EVERY == 0:
-            self._voltage_base = round(
-                max(self._VOLTAGE_FLOOR, self._voltage_base - self._STEP_VOLT), 3
-            )
-
-        voltage = round(
-            _clamp(self._voltage_base + random.uniform(-0.1, 0.1), self._VOLTAGE_FLOOR, 15.0),
-            3,
-        )
-
-        erratic = self._voltage_base < self._ERRATIC_THRESHOLD
-        base_rpm = random.uniform(800.0, 2500.0)
-
-        if erratic:
-            rpm = round(
-                _clamp(
-                    base_rpm + random.uniform(-self._RPM_ERRATIC_SWING, self._RPM_ERRATIC_SWING),
-                    300.0,
-                    5000.0,
-                ),
-                1,
-            )
-            logger.warning(
-                "[%s] BATTERY_DEGRADATION anomaly injected — voltage: %.3f V "
-                "(base: %.3f V, erratic RPM: %.0f, reading #%d)",
-                self.name, voltage, self._voltage_base, rpm, self.reading_count,
-            )
-        else:
-            rpm = round(base_rpm, 1)
-
-        return {
-            "engine_temp":     _rand(75.0, 95.0,  2),
-            "rpm":             rpm,
-            "fuel_level":      _rand(30.0, 90.0,  2),
-            "battery_voltage": voltage,
-            "speed":           _rand(0.0,  100.0, 2),
-            "vibration":       _rand(0.5,  2.5,   3),
-        }
-
-
-# ── Vehicle 4 — Truck-Delta (transmission stress / slip) ─────────────────────
-
-class TruckDelta(BaseVehicle):
-    """
-    RPM spikes occur at high speed, simulating a slipping transmission that
-    over-revs under load. The drivetrain resonance during slip also increases
-    vibration measurably.
-
-    Fault pattern:
-        speed ≤ 70 km/h → normal RPM (800–2500), normal vibration (0.5–2.5)
-        speed >  70 km/h → slip RPM (3500–4500), elevated vibration (3.5–6.0)
-
-    Engine temperature and battery stay in normal range — this is a purely
-    mechanical drivetrain fault, not thermal or electrical.
-
-    Fault label logged: TRANSMISSION_SLIP
-    """
-
-    name        = "Truck-Delta"
-    device_type = "truck"
-
-    _SPEED_THRESHOLD: float = 70.0
-    _SLIP_RPM_LO:     float = 3500.0
-    _SLIP_RPM_HI:     float = 4500.0
-    _SLIP_VIB_LO:     float = 3.5
-    _SLIP_VIB_HI:     float = 6.0
-
-    def _build_telemetry(self) -> dict[str, Any]:
-        speed = _rand(0.0, 110.0, 2)
-        slipping = speed > self._SPEED_THRESHOLD
-
-        if slipping:
-            rpm       = _rand(self._SLIP_RPM_LO, self._SLIP_RPM_HI, 1)
-            vibration = _rand(self._SLIP_VIB_LO, self._SLIP_VIB_HI, 3)
-            logger.warning(
-                "[%s] TRANSMISSION_SLIP anomaly injected — speed: %.1f km/h, "
-                "rpm: %.0f, vibration: %.2f (reading #%d)",
-                self.name, speed, rpm, vibration, self.reading_count,
-            )
-        else:
-            rpm       = _rand(800.0, 2500.0, 1)
-            vibration = _rand(0.5,   2.5,    3)
-
-        return {
-            "engine_temp":     _rand(75.0, 95.0,  2),
-            "rpm":             rpm,
-            "fuel_level":      _rand(30.0, 90.0,  2),
-            "battery_voltage": _rand(12.8, 14.2,  3),
-            "speed":           speed,
-            "vibration":       vibration,
-        }
-
-
-# ── Vehicle 5 — Truck-Echo (brake wear / wheel bearing failure) ──────────────
-
-class TruckEcho(BaseVehicle):
-    """
-    Vibration amplifies with speed, simulating a worn wheel bearing or brake
-    pad that has reached metal-on-metal contact. The fault is invisible at low
-    speeds (bearing load is minimal) but escalates sharply on highway runs.
-
-    This is particularly interesting for the ML ensemble: engine temp and RPM
-    stay completely normal, so only the vibration-speed cross-sensor ratio
-    (vib_per_speed engineered feature) can catch it.
-
-    Fault pattern:
-        speed < 60 km/h  → normal  vibration: 0.5–3.0
-        60 ≤ speed < 90  → elevated vibration: 5.0–8.0  (WHEEL_BEARING_ELEVATED)
-        speed ≥ 90 km/h  → severe  vibration: 7.0–10.0  (WHEEL_BEARING_SEVERE)
-    """
-
-    name        = "Truck-Echo"
-    device_type = "truck"
-
-    _THRESH_MED: float = 60.0
-    _THRESH_HI:  float = 90.0
-
-    def _build_telemetry(self) -> dict[str, Any]:
-        speed = _rand(0.0, 110.0, 2)
-
-        if speed >= self._THRESH_HI:
-            vibration   = _rand(7.0, 10.0, 3)
-            fault_label = "WHEEL_BEARING_SEVERE"
-        elif speed >= self._THRESH_MED:
-            vibration   = _rand(5.0, 8.0, 3)
-            fault_label = "WHEEL_BEARING_ELEVATED"
-        else:
-            vibration   = _rand(0.5, 3.0, 3)
-            fault_label = None
-
-        if fault_label:
-            logger.warning(
-                "[%s] %s anomaly injected — speed: %.1f km/h, "
-                "vibration: %.2f (reading #%d)",
-                self.name, fault_label, speed, vibration, self.reading_count,
-            )
-
-        return {
-            "engine_temp":     _rand(75.0,  95.0,  2),
-            "rpm":             _rand(800.0, 2500.0, 1),
-            "fuel_level":      _rand(30.0,  90.0,  2),
-            "battery_voltage": _rand(12.8,  14.2,  3),
-            "speed":           speed,
-            "vibration":       vibration,
-        }
-
-
-# ── Fleet definition ─────────────────────────────────────────────────────────
-
-FLEET: list[BaseVehicle] = [
-    TruckAlpha(),   # 1 — control
-    TruckBeta(),    # 2 — coolant leak
-    TruckGamma(),   # 3 — battery degradation
-    TruckDelta(),   # 4 — transmission slip
-    TruckEcho(),    # 5 — wheel bearing
-]
-
-
-# ── API helpers ───────────────────────────────────────────────────────────────
-
-async def _authenticate(
-    client: httpx.AsyncClient, host: str, email: str, password: str
-) -> str:
-    resp = await client.post(
-        f"{host}/api/v1/auth/login",
-        json={"email": email, "password": password},
-    )
-    resp.raise_for_status()
-    token = resp.json()["access_token"]
-    logger.info("Authenticated as %s", email)
-    return token
-
-
-async def register_and_login(
-    client: httpx.AsyncClient, host: str, email: str, password: str
-) -> str:
-    """Attempt registration (idempotent — 409 on duplicate is expected), then login."""
-    try:
-        await client.post(
-            f"{host}/api/v1/auth/register",
-            json={"email": email, "password": password, "role": "ADMIN"},
-        )
-    except httpx.HTTPError:
-        pass  # already registered
-    return await _authenticate(client, host, email, password)
-
-
-async def _get_user_id(client: httpx.AsyncClient, host: str, token: str) -> str:
-    resp = await client.get(
-        f"{host}/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    resp.raise_for_status()
-    return resp.json()["id"]
-
-
-async def _create_device(
-    client: httpx.AsyncClient,
-    host: str,
-    token: str,
-    vehicle: BaseVehicle,
-    owner_id: str,
-) -> str:
-    resp = await client.post(
-        f"{host}/api/v1/devices",
-        json={
-            "name":        vehicle.name,
-            "device_type": vehicle.device_type,
-            "owner_id":    owner_id,
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    resp.raise_for_status()
-    device_id = resp.json()["id"]
-    logger.info(
-        "Registered %-14s  type=%-10s  id=%s",
-        vehicle.name, vehicle.device_type, device_id,
-    )
-    return device_id
-
-
-# ── Per-vehicle telemetry loop ────────────────────────────────────────────────
-
-async def simulate_vehicle(
-    client:    httpx.AsyncClient,
-    host:      str,
-    token:     str,
-    device_id: str,
-    vehicle:   BaseVehicle,
-    interval:  float = 2.0,
-) -> None:
-    logger.info("[%s] Telemetry stream started → device_id=%s", vehicle.name, device_id)
-
-    while True:
-        reading = vehicle.generate_reading()
-
-        try:
-            resp = await client.post(
-                f"{host}/api/v1/devices/{device_id}/telemetry",
-                json=reading,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10.0,
-            )
-            if resp.status_code != 201:
-                logger.warning(
-                    "[%s] Unexpected HTTP %d on reading #%d",
-                    vehicle.name, resp.status_code, vehicle.reading_count,
-                )
-        except httpx.HTTPError as exc:
-            logger.error("[%s] HTTP error on reading #%d: %s", vehicle.name, vehicle.reading_count, exc)
-
-        await asyncio.sleep(interval)
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-async def main(
-    host:         str,
-    num_vehicles: int,
-    email:        str,
-    password:     str,
-    interval:     float,
-) -> None:
-    active_fleet = FLEET[:num_vehicles]
-
-    async with httpx.AsyncClient() as client:
-        token    = await register_and_login(client, host, email, password)
-        owner_id = await _get_user_id(client, host, token)
-
-        pairs: list[tuple[BaseVehicle, str]] = []
-        for vehicle in active_fleet:
-            try:
-                device_id = await _create_device(client, host, token, vehicle, owner_id)
-                pairs.append((vehicle, device_id))
-            except Exception as exc:
-                logger.error("Failed to register %s: %s", vehicle.name, exc)
-
-        if not pairs:
-            logger.error("No vehicles registered — cannot start simulation. Exiting.")
+    driver = "Driver"
+    cruise_kmh = (55.0, 80.0)
+    accel_kmh_per_s = 1.5          # gentle
+    harsh_probability = 0.0        # chance per reading of a harsh accel/brake
+    speeding_probability = 0.0
+    tank_liters = 400.0
+    l_per_100km = 32.0
+
+    def __init__(self, interval: float) -> None:
+        self.interval = interval
+        self.n = 0
+        self.pos = (DEPOT[0] + random.uniform(-0.003, 0.003), DEPOT[1] + random.uniform(-0.003, 0.003))
+        self.speed = 0.0
+        self.target_speed = random.uniform(*self.cruise_kmh)
+        self.fuel = random.uniform(55, 90)
+        self.engine_temp = 20.0
+        self.dwell = random.randint(5, 20)       # readings to wait before departing
+        self.waypoints = self._route()
+        self.dtc: list[str] = []
+
+    def _route(self) -> list[tuple[float, float]]:
+        stops = random.sample(list(CUSTOMERS.values()), 3)
+        return stops + [DEPOT]
+
+    # ── physics ──────────────────────────────────────────────────────────────
+    def _drive(self) -> None:
+        if self.dwell > 0:
+            self.dwell -= 1
+            self.speed = max(0.0, self.speed - 8 * self.interval)
+            self.on_stop()
+            return
+        target = self.waypoints[0]
+        dist = _km_between(self.pos, target)
+        if dist < 0.15:
+            self.waypoints.pop(0)
+            if not self.waypoints:
+                self.waypoints = self._route()
+            self.dwell = random.randint(15, 45)
+            if self.fuel < 25:
+                self.fuel = random.uniform(88, 97)   # refuel at the stop
             return
 
-        logger.info(
-            "Simulation running — %d vehicle(s) | %.1fs interval | Ctrl-C to stop",
-            len(pairs), interval,
-        )
-        for v, did in pairs:
-            logger.info("  %-14s  fault=%-24s  device_id=%s", v.name, type(v).__doc__.split("\n")[1].strip(), did)
+        if random.random() < 0.02:
+            self.target_speed = random.uniform(*self.cruise_kmh)
+        wanted = self.target_speed
+        if random.random() < self.speeding_probability:
+            wanted = random.uniform(105, 118)
+        if dist < 0.8:
+            wanted = min(wanted, 25 + dist * 40)   # slow down approaching the stop
 
-        tasks = [
-            asyncio.create_task(
-                simulate_vehicle(client, host, token, device_id, vehicle, interval)
-            )
-            for vehicle, device_id in pairs
+        step = self.accel_kmh_per_s * self.interval
+        if random.random() < self.harsh_probability:
+            step = random.uniform(8, 12) * self.interval   # ≥ 3 m/s² — a harsh event
+            wanted = 0 if random.random() < 0.5 else wanted + 40
+        if self.speed < wanted:
+            self.speed = min(wanted, self.speed + step)
+        else:
+            self.speed = max(wanted, self.speed - step * 1.5)
+        self.speed = max(0.0, self.speed)
+
+        km = self.speed * self.interval / 3600.0
+        if km > 0:
+            frac = min(1.0, km / dist)
+            self.pos = (self.pos[0] + (target[0] - self.pos[0]) * frac,
+                        self.pos[1] + (target[1] - self.pos[1]) * frac)
+            self.fuel = max(3.0, self.fuel - km * self.l_per_100km / 100.0 / self.tank_liters * 100.0)
+
+    def on_stop(self) -> None:
+        """Hook for events that happen while parked (e.g. fuel theft)."""
+
+    # ── sensors ──────────────────────────────────────────────────────────────
+    def base(self) -> dict[str, Any]:
+        self.engine_temp += (88.0 - self.engine_temp) * 0.05 + random.uniform(-0.4, 0.4)
+        rpm = 750 + self.speed * 18 + random.uniform(-80, 80) if self.speed > 1 else random.uniform(650, 800)
+        vibration = 0.6 + self.speed * 0.012 + random.uniform(-0.15, 0.25)
+        return {
+            "engine_temp": round(self.engine_temp, 2),
+            "rpm": round(rpm, 1),
+            "battery_voltage": round(random.uniform(13.6, 14.2), 3),
+            "vibration": round(max(0.1, vibration), 3),
+            "oil_pressure": round(random.uniform(35, 48) if self.speed > 1 else random.uniform(22, 30), 1),
+            "coolant_level": round(random.uniform(93, 97), 1),
+            "tire_pressure": round(random.uniform(102, 108), 1),
+            "ambient_temp": round(14 + 4 * math.sin(self.n / 900.0), 1),
+        }
+
+    def apply_fault(self, r: dict[str, Any]) -> None:
+        """Override in subclasses."""
+
+    def reading(self) -> dict[str, Any]:
+        self.n += 1
+        self._drive()
+        r = self.base()
+        self.dtc = []
+        self.apply_fault(r)
+        r.update({
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "gps_lat": round(self.pos[0], 6),
+            "gps_lon": round(self.pos[1], 6),
+            "speed": round(self.speed, 2),
+            "fuel_level": round(_clamp(self.fuel, 0, 100), 2),
+            "dtc_codes": self.dtc or None,
+        })
+        return r
+
+
+class TruckAlpha(Vehicle):
+    """Healthy control vehicle with a careful driver."""
+    name, driver = "Truck-Alpha", "Priya Shah"
+
+
+class TruckBeta(Vehicle):
+    """Coolant leak: +4 °C every 20 readings up to +27 °C; coolant level drains; DTC P0217 when overheating."""
+    name, driver = "Truck-Beta", "Tom Walsh"
+
+    def apply_fault(self, r: dict[str, Any]) -> None:
+        offset = min(27.0, 4.0 * (self.n // 20))
+        r["engine_temp"] = round(r["engine_temp"] + offset + random.uniform(-2, 2), 2)
+        r["coolant_level"] = round(max(20.0, 96 - self.n * 0.12 + random.uniform(-1, 1)), 1)
+        r["vibration"] = round(r["vibration"] + offset * 0.04, 3)
+        if r["engine_temp"] > 112:
+            self.dtc.append("P0217")
+
+
+class TruckGamma(Vehicle):
+    """Failing alternator: voltage −0.05 V every 15 readings from 13.8 V; erratic RPM and DTC P0562 below 11.8 V."""
+    name, driver = "Truck-Gamma", "Marek Nowak"
+
+    def apply_fault(self, r: dict[str, Any]) -> None:
+        base = max(9.0, 13.8 - 0.05 * (self.n // 15))
+        r["battery_voltage"] = round(base + random.uniform(-0.08, 0.08), 3)
+        if base < 11.8:
+            r["rpm"] = round(_clamp(r["rpm"] + random.uniform(-500, 500), 300, 5000), 1)
+            self.dtc.append("P0562")
+
+
+class TruckDelta(Vehicle):
+    """Transmission slip above 70 km/h (RPM 3500–4500, DTC P0730). Aggressive driver. Fuel thefts when parked."""
+    name, driver = "Truck-Delta", "Jake Miller"
+    cruise_kmh = (70.0, 95.0)
+    accel_kmh_per_s = 3.0
+    harsh_probability = 0.03
+    speeding_probability = 0.05
+
+    def _route(self) -> list[tuple[float, float]]:
+        # Always cuts through the restricted zone on the way to a customer.
+        stops = random.sample(list(CUSTOMERS.values()), 2)
+        return [RESTRICTED[1], *stops, DEPOT]
+
+    def on_stop(self) -> None:
+        if random.random() < 0.01 and self.fuel > 30:
+            self.fuel -= random.uniform(10, 16)      # siphoned
+            logger.warning("[%s] fuel theft injected at %.5f, %.5f", self.name, *self.pos)
+
+    def apply_fault(self, r: dict[str, Any]) -> None:
+        if self.speed > 70:
+            r["rpm"] = round(random.uniform(3500, 4500), 1)
+            r["vibration"] = round(random.uniform(3.5, 6.0), 3)
+            if random.random() < 0.3:
+                self.dtc.append("P0730")
+
+
+class TruckEcho(Vehicle):
+    """Wheel bearing: vibration 5–8 g at 60–90 km/h and 7–10 g above (DTC C0040). Drives through dead zones."""
+    name, driver = "Truck-Echo", "Aisha Bello"
+    cruise_kmh = (60.0, 100.0)
+
+    def apply_fault(self, r: dict[str, Any]) -> None:
+        if self.speed >= 90:
+            r["vibration"] = round(random.uniform(7.0, 10.0), 3)
+            self.dtc.append("C0040")
+        elif self.speed >= 60:
+            r["vibration"] = round(random.uniform(5.0, 8.0), 3)
+
+    def offline(self) -> bool:
+        # ~60 s without coverage out of every ~10 minutes
+        cycle = int(600 / self.interval)
+        return (self.n % cycle) > cycle - int(60 / self.interval)
+
+
+FLEET = [TruckAlpha, TruckBeta, TruckGamma, TruckDelta, TruckEcho]
+
+
+# ── Setup via the API ─────────────────────────────────────────────────────────
+
+class Setup:
+    def __init__(self, client: httpx.AsyncClient, host: str, email: str, password: str, org: str) -> None:
+        self.c, self.host, self.email, self.password, self.org = client, host, email, password, org
+        self.h: dict[str, str] = {}
+
+    async def auth(self) -> None:
+        r = await self.c.post(f"{self.host}{API}/auth/login", json={"email": self.email, "password": self.password})
+        if r.status_code == 401:
+            reg = await self.c.post(f"{self.host}{API}/auth/register", json={
+                "email": self.email, "password": self.password, "full_name": "Fleet Admin",
+                "organization_name": self.org,
+            })
+            reg.raise_for_status()
+            logger.info("Created organization '%s' with admin %s", self.org, self.email)
+            r = await self.c.post(f"{self.host}{API}/auth/login", json={"email": self.email, "password": self.password})
+        r.raise_for_status()
+        self.h = {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+    async def get(self, path: str) -> Any:
+        r = await self.c.get(f"{self.host}{API}{path}", headers=self.h)
+        r.raise_for_status()
+        return r.json()
+
+    async def post(self, path: str, body: dict | None = None) -> Any:
+        r = await self.c.post(f"{self.host}{API}{path}", json=body, headers=self.h)
+        r.raise_for_status()
+        return r.json()
+
+    async def patch(self, path: str, body: dict) -> Any:
+        r = await self.c.patch(f"{self.host}{API}{path}", json=body, headers=self.h)
+        r.raise_for_status()
+        return r.json()
+
+    async def org_fixtures(self) -> None:
+        fences = {g["name"] for g in await self.get("/geofences")}
+        wanted = [
+            {"name": "Park Royal Depot", "kind": "DEPOT", "center_lat": DEPOT[0], "center_lon": DEPOT[1],
+             "radius_m": 500, "alert_on_exit": False},
+            *[{"name": n, "kind": "CUSTOMER", "center_lat": p[0], "center_lon": p[1], "radius_m": 350,
+               "alert_on_enter": False} for n, p in CUSTOMERS.items()],
+            {"name": RESTRICTED[0], "kind": "RESTRICTED", "center_lat": RESTRICTED[1][0],
+             "center_lon": RESTRICTED[1][1], "radius_m": RESTRICTED[2], "speed_limit_kmh": RESTRICTED[3],
+             "alert_on_enter": True},
         ]
+        for g in wanted:
+            if g["name"] not in fences:
+                await self.post("/geofences", g)
+                logger.info("Created geofence %s", g["name"])
 
+    async def vehicle(self, v: Vehicle) -> tuple[str, str]:
+        devices = {d["name"]: d for d in await self.get("/devices")}
+        drivers = {d["name"]: d for d in await self.get("/drivers")}
+        driver = drivers.get(v.driver) or await self.post("/drivers", {"name": v.driver})
+        device = devices.get(v.name)
+        if device is None:
+            device = await self.post("/devices", {
+                "name": v.name, "device_type": v.device_type, "make": "Volvo", "model": "FH",
+                "year": random.choice([2019, 2020, 2021, 2022]), "fuel_tank_liters": v.tank_liters,
+                "license_plate": f"LX{random.randint(10, 99)} {''.join(random.choices('ABCDEFGHJKLMNPRSTUVWXYZ', k=3))}",
+                "odometer_km": round(random.uniform(40_000, 160_000)),
+            })
+            await self.post("/maintenance/schedules", {
+                "device_id": device["id"], "name": "Engine oil & filter", "interval_km": 25_000,
+                "interval_days": 180,
+            })
+            logger.info("Registered %s", v.name)
+        if device.get("assigned_driver_id") != driver["id"]:
+            await self.patch(f"/devices/{device['id']}", {"assigned_driver_id": driver["id"]})
+        key = (await self.post(f"/devices/{device['id']}/api-key"))["api_key"]
+        return device["id"], key
+
+
+# ── Streaming ─────────────────────────────────────────────────────────────────
+
+async def stream(client: httpx.AsyncClient, host: str, key: str, v: Vehicle) -> None:
+    headers = {"X-Device-Key": key}
+    buffer: list[dict[str, Any]] = []
+    while True:
+        reading = v.reading()
+        offline = isinstance(v, TruckEcho) and v.offline()
         try:
-            await asyncio.gather(*tasks)
-        except asyncio.CancelledError:
-            for task in tasks:
-                task.cancel()
+            if offline:
+                if not buffer:
+                    logger.info("[%s] lost coverage — buffering", v.name)
+                buffer.append(reading)
+            elif buffer:
+                buffer.append(reading)
+                r = await client.post(f"{host}{API}/ingest/telemetry/batch", json={"readings": buffer},
+                                      headers=headers, timeout=15)
+                if r.status_code == 201:
+                    logger.info("[%s] back online — uploaded %s", v.name, r.json())
+                    buffer.clear()
+            else:
+                r = await client.post(f"{host}{API}/ingest/telemetry", json=reading, headers=headers, timeout=10)
+                if r.status_code not in (201, 409):
+                    logger.warning("[%s] HTTP %d: %s", v.name, r.status_code, r.text[:200])
+        except httpx.HTTPError as exc:
+            logger.error("[%s] %s — keeping reading in buffer", v.name, exc)
+            if reading not in buffer:
+                buffer.append(reading)
+            buffer = buffer[-500:]
+        await asyncio.sleep(v.interval)
+
+
+async def main(args: argparse.Namespace) -> None:
+    async with httpx.AsyncClient() as client:
+        setup = Setup(client, args.host, args.email, args.password, args.org)
+        await setup.auth()
+        await setup.org_fixtures()
+        vehicles = [cls(args.interval) for cls in FLEET[: args.devices]]
+        tasks = []
+        for v in vehicles:
+            _, key = await setup.vehicle(v)
+            tasks.append(asyncio.create_task(stream(client, args.host, key, v)))
+            logger.info("%-12s driver=%-12s %s", v.name, v.driver, (type(v).__doc__ or "").strip())
+        logger.info("Streaming %d vehicles every %.1fs — open %s and sign in as %s", len(tasks), args.interval,
+                    args.host, args.email)
+        await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="VehicleWatch Fleet Simulator — 5 unique fault personalities",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Fault personalities (run in order up to --devices limit):
-  1  Truck-Alpha   Healthy baseline, no anomalies (control vehicle)
-  2  Truck-Beta    Developing coolant leak — engine_temp rises 4°C/20 readings
-  3  Truck-Gamma   Battery degradation — voltage drops 0.05V/15 readings → erratic RPM
-  4  Truck-Delta   Transmission slip — RPM 3500-4500 when speed > 70 km/h
-  5  Truck-Echo    Wheel bearing failure — vibration scales with speed
-        """,
-    )
-    parser.add_argument("--host",     default="http://localhost:8000",
-                        help="API base URL (default: http://localhost:8000)")
-    parser.add_argument("--devices",  type=int, default=5,
-                        help="Number of vehicles to simulate, 1–5 (default: 5)")
-    parser.add_argument("--email",    default="simulator@vehiclewatch.io",
-                        help="Admin account email")
-    parser.add_argument("--password", default="simulator123",
-                        help="Admin account password")
-    parser.add_argument("--interval", type=float, default=2.0,
-                        help="Seconds between readings per vehicle (default: 2.0)")
-    args = parser.parse_args()
-
-    num = max(1, min(args.devices, len(FLEET)))
-    if num != args.devices:
-        logger.warning("--devices=%d out of range — clamped to %d", args.devices, num)
-
+    p = argparse.ArgumentParser(description="VehicleWatch fleet simulator", epilog=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--host", default="http://localhost:8000")
+    p.add_argument("--devices", type=int, default=5, help="1–5 vehicles")
+    p.add_argument("--email", default="demo@vehiclewatch.io")
+    p.add_argument("--password", default="demo-fleet-2026")
+    p.add_argument("--org", default="Demo Logistics Ltd")
+    p.add_argument("--interval", type=float, default=2.0, help="seconds between readings per vehicle")
+    a = p.parse_args()
+    a.devices = max(1, min(a.devices, len(FLEET)))
     try:
-        asyncio.run(main(args.host, num, args.email, args.password, args.interval))
+        asyncio.run(main(a))
     except KeyboardInterrupt:
-        logger.info("Simulator stopped by user")
+        logger.info("Simulator stopped")
         sys.exit(0)

@@ -7,12 +7,12 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  backend:
     runs-on: ubuntu-latest
 
     services:
       postgres:
-        image: postgres:15
+        image: postgres:16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: testpassword
@@ -25,49 +25,52 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:testpassword@localhost:5432/vehiclewatch_test
+      REDIS_URL: redis://localhost:6379
+      SECRET_KEY: test-secret-key-for-ci-minimum-32-chars
+      ENVIRONMENT: test
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          python-version: "3.12"
+          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run migrations
-        env:
-          DATABASE_URL: postgresql+asyncpg://postgres:testpassword@localhost:5432/vehiclewatch_test
-          REDIS_URL: redis://localhost:6379
-          SECRET_KEY: test-secret-key-for-ci-minimum-32-chars
-          GEMINI_API_KEY: test-key
-          ENVIRONMENT: test
-        run: alembic upgrade head
-
-      - name: Run tests with coverage
-        env:
-          DATABASE_URL: postgresql+asyncpg://postgres:testpassword@localhost:5432/vehiclewatch_test
-          REDIS_URL: redis://localhost:6379
-          SECRET_KEY: test-secret-key-for-ci-minimum-32-chars
-          GEMINI_API_KEY: test-key
-          ENVIRONMENT: test
+      # Upgrade, downgrade and re-upgrade against real PostgreSQL to prove the migrations are reversible.
+      - name: Migrations (up / down / up)
         run: |
-          pip install pytest-cov
-          pytest tests/ -v --cov=app --cov-report=term-missing --cov-fail-under=70
+          alembic upgrade head
+          alembic downgrade 002
+          alembic upgrade head
+
+      - name: Tests with coverage
+        run: pytest tests/ -v --cov=app --cov-report=term-missing --cov-fail-under=70
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t vehiclewatch:ci .

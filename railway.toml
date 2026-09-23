@@ -2,7 +2,7 @@
 builder = "dockerfile"
 
 [deploy]
-startCommand = "alembic upgrade head && python scripts/check_startup.py && uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1 --log-level debug 2>&1"
+startCommand = "alembic upgrade head && python scripts/check_startup.py && uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1 --proxy-headers"
 healthcheckPath = "/health"
 healthcheckTimeout = 300
 restartPolicyType = "on_failure"

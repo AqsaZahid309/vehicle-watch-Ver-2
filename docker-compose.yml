@@ -1,16 +1,20 @@
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://vehiclewatch:vehiclewatch@postgres:5432/vehiclewatch
+  REDIS_URL: redis://redis:6379/0
+
 services:
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     container_name: vehiclewatch_api
     ports:
       - "8000:8000"
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
-      DATABASE_URL: postgresql+asyncpg://vehiclewatch:vehiclewatch@postgres:5432/vehiclewatch
-      REDIS_URL: redis://redis:6379/0
+      <<: *app-env
+      RUN_WORKER_IN_API: "false"
+      WEB_CONCURRENCY: "2"
     depends_on:
       postgres:
         condition: service_healthy
@@ -23,11 +27,33 @@ services:
       retries: 3
       start_period: 40s
     restart: unless-stopped
-    volumes:
-      - .:/app
+
+  worker:
+    build: .
+    container_name: vehiclewatch_worker
+    command: ["python", "-m", "app.workers.runner"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      <<: *app-env
+    depends_on:
+      api:
+        condition: service_healthy   # api runs the migrations first
+    restart: unless-stopped
+
+  simulator:
+    build: .
+    container_name: vehiclewatch_simulator
+    command: ["python", "simulator/device_simulator.py", "--host", "http://api:8000"]
+    depends_on:
+      api:
+        condition: service_healthy
+    profiles: ["demo"]
+    restart: unless-stopped
 
   postgres:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
     container_name: vehiclewatch_postgres
     environment:
       POSTGRES_USER: vehiclewatch
