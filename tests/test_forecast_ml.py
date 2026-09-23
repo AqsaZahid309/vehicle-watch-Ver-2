@@ -212,3 +212,34 @@ async def test_forecast_service_on_degrading_vehicle(db_session: AsyncSession) -
     assert battery.hours_to_threshold == pytest.approx(7.3, abs=1.0)       # (11.5 − 12.6) / −0.15
     assert fc.overall_risk == "CRITICAL"
     assert fc.min_hours_to_failure == battery.hours_to_threshold
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_batch_sets_baseline_without_alerting(db_session: AsyncSession) -> None:
+    """A brand-new fleet's first batch trains the model but is not scored against itself."""
+    org = await make_org(db_session)
+    device = await make_device(db_session, org)
+    await _seed(db_session, device, 60, datetime.now(timezone.utc) - timedelta(minutes=5))
+    alerts = await AnomalyService(db_session).run_for_device(device.id)
+    assert alerts == []
+    assert device.anomaly_watermark is not None
+    [v] = (await db_session.execute(select(ModelVersion))).scalars().all()
+    assert v.n_train == 60
+
+
+@pytest.mark.asyncio
+async def test_young_model_grows_quickly(db_session: AsyncSession) -> None:
+    """A model trained on a short cold-start window is retrained once clean history doubles."""
+    org = await make_org(db_session)
+    device = await make_device(db_session, org)
+    start = datetime.now(timezone.utc) - timedelta(minutes=20)
+    await _seed(db_session, device, 40, start)
+    svc = AnomalyService(db_session)
+    await svc.run_for_device(device.id)                    # bootstrap on 40 readings
+    await _seed(db_session, device, 50, start + timedelta(seconds=100), seed=5)
+    await svc.run_for_device(device.id)                    # scores the 50 new readings
+    await _seed(db_session, device, 5, start + timedelta(seconds=300), seed=6)
+    await svc.run_for_device(device.id)                    # the 50 are now scored history → grow
+    versions = (await db_session.execute(select(ModelVersion).order_by(ModelVersion.version))).scalars().all()
+    assert [v.reason for v in versions] == ["INITIAL", "GROWTH"]
+    assert versions[-1].n_train > versions[0].n_train

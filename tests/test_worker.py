@@ -35,9 +35,11 @@ async def test_worker_cycle(engine, monkeypatch) -> None:
         device = await make_device(db, org)
         device.odometer_km = 20_000
         rng = np.random.default_rng(0)
-        for i in range(120):   # 4 minutes of healthy driving, then one badly overheating reading
+        # 4 minutes of healthy driving two hours ago (the baseline, older than the
+        # worker's first-run backfill window), then one badly overheating reading now.
+        for i in range(120):
             db.add(Telemetry(
-                id=uuid.uuid4(), device_id=device.id, recorded_at=now - timedelta(seconds=240 - 2 * i),
+                id=uuid.uuid4(), device_id=device.id, recorded_at=now - timedelta(hours=2, seconds=-2 * i),
                 gps_lat=51.5, gps_lon=-0.1 + 0.0003 * i, engine_temp=85 + rng.normal(0, 2),
                 rpm=1500 + rng.normal(0, 100), fuel_level=60 - 0.01 * i, battery_voltage=13.6,
                 speed=55 + rng.normal(0, 3), vibration=1.1,
@@ -60,7 +62,7 @@ async def test_worker_cycle(engine, monkeypatch) -> None:
         alerts = (await db.execute(select(Alert).where(Alert.device_id == device_id)
                                    .order_by(Alert.created_at))).scalars().all()
         new = [a for a in alerts if a.telemetry_id is not None]
-        assert new, "the overheating reading should raise an alert"
+        assert len(new) == 1, "only the overheating reading should raise an alert"
         assert all(a.llm_summary for a in new)
         assert alerts[0].escalated_at is not None                      # escalated
 
@@ -70,9 +72,10 @@ async def test_worker_cycle(engine, monkeypatch) -> None:
         wo = (await db.execute(select(WorkOrder))).scalars().unique().one()
         assert wo.title.startswith("Scheduled: Oil change")
 
-        trip = (await db.execute(select(Trip))).scalars().unique().one()
-        assert trip.point_count == 121
-        assert trip.distance_km > 1
+        trips = (await db.execute(select(Trip).order_by(Trip.started_at))).scalars().unique().all()
+        assert len(trips) == 2                                          # split by the 2 h gap
+        assert trips[0].point_count == 120 and not trips[0].is_open
+        assert trips[0].distance_km > 1
 
     # The lock is released and a second cycle is a no-op for already-processed data.
     assert "vw:worker:lock" not in redis.store

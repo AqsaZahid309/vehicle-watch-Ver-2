@@ -442,10 +442,15 @@ class AnomalyService:
         )
         return list((await self._db.execute(stmt)).scalars().all())
 
-    async def _count_clean_since(self, device_ids: list[uuid.UUID], after: datetime | None) -> int:
+    async def _count_clean_since(
+        self, device_ids: list[uuid.UUID], after: datetime | None, before: datetime | None = None
+    ) -> int:
+        """Clean readings newer than `after` — and, when given, older than `before` (already scored)."""
         sub = _clean_telemetry(device_ids)
         if after is not None:
             sub = sub.where(Telemetry.recorded_at > after)
+        if before is not None:
+            sub = sub.where(Telemetry.recorded_at < before)
         return (await self._db.execute(select(func.count()).select_from(sub.subquery()))).scalar_one()
 
     async def _last_alert_time(self, device_id: uuid.UUID) -> datetime | None:
@@ -600,10 +605,19 @@ class AnomalyService:
             reason = "INITIAL" if version is None else "SCHEDULED"  # artifact lost → rebuild
         elif manual:
             reason = "MANUAL"
+        elif bundle.n_train < settings.anomaly_training_samples and (
+            await self._count_clean_since([device.id], as_utc(version.window_end), scoring_start)
+            >= max(bundle.n_train, settings.anomaly_min_training_samples)
+        ):
+            # Growth phase: a young model trained on a few minutes of data (often a
+            # cold start — engine warming up, truck parked) makes everything after it
+            # look anomalous. Retrain whenever the clean history has doubled, without
+            # waiting for the hourly limit, until the full training window is reached.
+            reason = "GROWTH"
         else:
             trained_at = as_utc(version.trained_at)
             if utcnow() - trained_at >= timedelta(minutes=settings.anomaly_retrain_min_interval_minutes):
-                new_clean = await self._count_clean_since([device.id], as_utc(version.window_end))
+                new_clean = await self._count_clean_since([device.id], as_utc(version.window_end), scoring_start)
                 recent = await self._training_records([device.id], scoring_start, settings.anomaly_training_samples)
                 drift = population_stability_index(bundle, _extract_features(recent)) if recent else None
                 if drift is not None and drift > settings.anomaly_drift_psi_threshold:
@@ -683,18 +697,20 @@ class AnomalyService:
         if bundle is None:
             bundle, version = await self._class_model(device)
         if bundle is None:
-            # Bootstrap: a brand-new fleet with no history anywhere. Train on what we
-            # have — contamination=0.05 flags only the most extreme readings, and the
-            # cooldown below prevents an alert storm.
+            # Bootstrap: a brand-new fleet with no history anywhere. The first batch
+            # becomes the baseline. It is NOT scored: a model scoring the very data it
+            # was trained on flags ~contamination (5 %) of it by construction, so every
+            # new vehicle — healthy or not — would raise an alert on day one.
             records = await self._training_records([device.id], None, settings.anomaly_training_samples)
             if len(records) < settings.anomaly_min_training_samples:
                 return []
-            bundle = _train(_extract_features(records))
-            version = await self._register(
-                bundle, records,
+            await self._register(
+                _train(_extract_features(records)), records,
                 org_id=device.organization_id, scope="DEVICE", device_id=device.id,
                 device_type=device.device_type, reason="INITIAL", drift_psi=None,
             )
+            device.anomaly_watermark = as_utc(new_records[-1].recorded_at)
+            return []
 
         X_new = _extract_features(new_records)
         iso_scores, lof_flags, _ = _ensemble_score(bundle, X_new)

@@ -32,7 +32,7 @@ class ModelVersion(Base):
     )
     device_type: Mapped[str] = mapped_column(String(100), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False)
-    reason: Mapped[str] = mapped_column(String(20), nullable=False)  # INITIAL | SCHEDULED | DRIFT | MANUAL
+    reason: Mapped[str] = mapped_column(String(20), nullable=False)  # INITIAL | GROWTH | SCHEDULED | DRIFT | MANUAL
     n_train: Mapped[int] = mapped_column(Integer, nullable=False)
     window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
