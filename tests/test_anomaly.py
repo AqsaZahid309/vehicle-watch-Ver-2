@@ -5,7 +5,7 @@ without relying on the full HTTP request lifecycle.
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
@@ -58,10 +58,11 @@ def test_identify_affected_metrics_anomalous() -> None:
 
 
 def test_score_to_severity_mapping() -> None:
+    # decision_function scale: 0 is the contamination boundary, negative = outlier
+    assert _score_to_severity(-0.02) == AlertSeverity.LOW
     assert _score_to_severity(-0.05) == AlertSeverity.LOW
-    assert _score_to_severity(-0.15) == AlertSeverity.LOW
-    assert _score_to_severity(-0.35) == AlertSeverity.MEDIUM
-    assert _score_to_severity(-0.55) == AlertSeverity.CRITICAL
+    assert _score_to_severity(-0.10) == AlertSeverity.MEDIUM
+    assert _score_to_severity(-0.20) == AlertSeverity.CRITICAL
 
 
 # ── Integration tests (with DB) ───────────────────────────────────────────────
@@ -159,28 +160,65 @@ async def test_anomaly_service_anomalous_data(
     from datetime import timedelta
     thirty_mins_ago = datetime.now(timezone.utc) - timedelta(minutes=30)
 
-    anomalous = Telemetry(
-        id=uuid.uuid4(),
-        device_id=seeded_device.id,
-        recorded_at=datetime.now(timezone.utc),
-        gps_lat=37.5,
-        gps_lon=-122.0,
-        engine_temp=145.0,   # massively above 105 normal max
-        rpm=5500.0,           # massively above 3000 normal max
-        fuel_level=55.0,
-        battery_voltage=9.0,  # below 11.5 min
-        speed=65.0,
-        vibration=9.8,        # near max 10
-    )
-    db_session.add(anomalous)
+    # A sustained fault (3 consecutive readings) — single spikes are ignored by design.
+    for i in range(3):
+        db_session.add(Telemetry(
+            id=uuid.uuid4(),
+            device_id=seeded_device.id,
+            recorded_at=datetime.now(timezone.utc) - timedelta(seconds=4 - 2 * i),
+            gps_lat=37.5,
+            gps_lon=-122.0,
+            engine_temp=145.0,   # massively above 105 normal max
+            rpm=5500.0,           # massively above 3000 normal max
+            fuel_level=55.0,
+            battery_voltage=9.0,  # below 11.5 min
+            speed=65.0,
+            vibration=9.8,        # near max 10
+        ))
     await db_session.flush()
 
     service = AnomalyService(db_session)
     # Scope to only the new anomalous record
     alerts = await service.run_for_device(seeded_device.id, since=thirty_mins_ago)
 
-    assert len(alerts) >= 1
+    assert len(alerts) == 1                     # cooldown: one alert per fault episode
     alert = alerts[0]
-    assert alert.anomaly_score < -0.1
+    assert alert.anomaly_score < 0              # IsolationForest outlier
     assert alert.device_id == seeded_device.id
-    assert alert.severity in (AlertSeverity.LOW, AlertSeverity.MEDIUM, AlertSeverity.CRITICAL)
+    assert alert.severity == AlertSeverity.CRITICAL   # ML outlier + safety-limit rule
+    assert alert.affected_metrics["ensemble"]["trigger"] == "ML+RULE"
+
+
+@pytest.mark.asyncio
+async def test_single_spike_is_not_alerted(db_session: AsyncSession, seeded_device: Device) -> None:
+    """One wild reading between normal ones is a sensor glitch, not a fault."""
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    rows = [(87.0, 13.2), (150.0, 9.0), (87.0, 13.2), (88.0, 13.1)]
+    for i, (temp, volts) in enumerate(rows):
+        db_session.add(Telemetry(
+            id=uuid.uuid4(), device_id=seeded_device.id, recorded_at=now - timedelta(seconds=8 - 2 * i),
+            gps_lat=37.0, gps_lon=-122.0, engine_temp=temp, rpm=1600.0, fuel_level=58.0,
+            battery_voltage=volts, speed=62.0, vibration=1.5,
+        ))
+    await db_session.flush()
+    alerts = await AnomalyService(db_session).run_for_device(seeded_device.id, since=now - timedelta(minutes=30))
+    assert alerts == []
+
+
+@pytest.mark.asyncio
+async def test_safety_limit_alerts_even_when_model_is_calm(db_session: AsyncSession, seeded_device: Device) -> None:
+    """A sustained battery collapse is alerted by the rule path even if the ML score is unremarkable."""
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    for i in range(4):
+        db_session.add(Telemetry(
+            id=uuid.uuid4(), device_id=seeded_device.id, recorded_at=now - timedelta(seconds=8 - 2 * i),
+            gps_lat=37.0, gps_lon=-122.0, engine_temp=88.0, rpm=1600.0, fuel_level=60.0,
+            battery_voltage=11.3, speed=60.0, vibration=1.6,
+        ))
+    await db_session.flush()
+    alerts = await AnomalyService(db_session).run_for_device(seeded_device.id, since=now - timedelta(minutes=30))
+    assert len(alerts) == 1
+    assert alerts[0].fault_type.value == "BATTERY_FAILURE"
+    assert alerts[0].severity in (AlertSeverity.MEDIUM, AlertSeverity.CRITICAL)

@@ -44,10 +44,12 @@ async def test_worker_cycle(engine, monkeypatch) -> None:
                 rpm=1500 + rng.normal(0, 100), fuel_level=60 - 0.01 * i, battery_voltage=13.6,
                 speed=55 + rng.normal(0, 3), vibration=1.1,
             ))
-        db.add(Telemetry(
-            id=uuid.uuid4(), device_id=device.id, recorded_at=now, gps_lat=51.5, gps_lon=-0.064,
-            engine_temp=150, rpm=5200, fuel_level=58.8, battery_voltage=10.5, speed=55, vibration=9.5,
-        ))
+        for i in range(3):   # a sustained fault — single spikes are ignored by design
+            db.add(Telemetry(
+                id=uuid.uuid4(), device_id=device.id, recorded_at=now - timedelta(seconds=4 - 2 * i),
+                gps_lat=51.5, gps_lon=-0.064, engine_temp=150, rpm=5200, fuel_level=58.8,
+                battery_voltage=10.5, speed=55, vibration=9.5,
+            ))
         # An old unacknowledged CRITICAL alert that should escalate
         db.add(Alert(id=uuid.uuid4(), device_id=device.id, severity=AlertSeverity.CRITICAL, anomaly_score=-0.7,
                      affected_metrics={}, created_at=now - timedelta(minutes=30)))
@@ -62,7 +64,7 @@ async def test_worker_cycle(engine, monkeypatch) -> None:
         alerts = (await db.execute(select(Alert).where(Alert.device_id == device_id)
                                    .order_by(Alert.created_at))).scalars().all()
         new = [a for a in alerts if a.telemetry_id is not None]
-        assert len(new) == 1, "only the overheating reading should raise an alert"
+        assert len(new) == 1, "one alert per fault episode (cooldown)"
         assert all(a.llm_summary for a in new)
         assert alerts[0].escalated_at is not None                      # escalated
 

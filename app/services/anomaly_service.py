@@ -35,7 +35,11 @@ Architecture decisions
    on the other vehicles of the same device_type in the organization until it
    has enough readings for its own model.
 
-7. Z-score feature contributions and per-device alert cooldown (unchanged).
+7. Alerting = (ML outlier OR safety-limit rule) AND persistence (M of the last
+   N readings abnormal) AND a per-device cooldown. Scores are IsolationForest
+   decision_function values: 0 is the contamination boundary, negative = outlier.
+
+8. Z-score feature contributions explain every alert.
 """
 
 import io
@@ -257,11 +261,20 @@ def _feature_contributions(x_raw: np.ndarray, bundle: _ModelBundle) -> list[dict
 
 
 def _ensemble_score(bundle: _ModelBundle, X_raw: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Anomaly score = IsolationForest.decision_function: 0 is the contamination
+    boundary, negative means outlier, and the further below 0 the more anomalous.
+
+    (score_samples — used previously — is centred around −0.45 for *normal*
+    points, so a "< −0.1 is anomalous" threshold flagged every healthy reading.)
+    """
     X = bundle.scaler.transform(X_raw)
-    iso_scores = bundle.iso.score_samples(X)
-    # LOF score_samples with novelty=True returns negative LOF scores; < -1.5 ⇒ local outlier.
-    lof_flags = bundle.lof.score_samples(X) < -1.5
+    iso_scores = bundle.iso.decision_function(X)
+    lof_flags = bundle.lof.decision_function(X) < 0
     return iso_scores, lof_flags, iso_scores
+
+
+_SEVERITY_RANK = {AlertSeverity.LOW: 0, AlertSeverity.MEDIUM: 1, AlertSeverity.CRITICAL: 2}
 
 
 def _score_to_severity(score: float) -> AlertSeverity:
@@ -718,15 +731,31 @@ class AnomalyService:
         last_alert_ts = as_utc(await self._last_alert_time(device.id))
         cooldown_until = last_alert_ts + timedelta(seconds=DEDUPE_WINDOW_SECS) if last_alert_ts else None
 
+        window = settings.anomaly_persistence_window
+        needed = settings.anomaly_persistence_min
+        recent: list[bool] = []
+
         created_alerts: list[Alert] = []
         for record, iso_score, lof_flagged, x_raw in zip(new_records, iso_scores, lof_flags, X_new):
-            if iso_score >= settings.anomaly_score_low:
-                continue  # not anomalous
+            fault_type, fault_confidence = fault_classifier(record)
+            ml_flag = iso_score < settings.anomaly_score_low
+            # Safety limits: a HIGH-confidence rule (hard threshold or ECU trouble code)
+            # is a fault even when the multivariate model finds the reading unremarkable —
+            # e.g. a battery at 11.4 V moves one of ten features and barely shifts the score.
+            rule_flag = fault_confidence == FaultConfidence.HIGH and fault_type != FaultType.UNKNOWN_ANOMALY
+
+            # Persistence: alert only when most of the last few readings are abnormal,
+            # so a single sensor glitch never pages anyone.
+            recent.append(ml_flag or rule_flag)
+            recent = recent[-window:]
+            if not (ml_flag or rule_flag) or sum(recent) < needed:
+                continue
             if cooldown_until and as_utc(record.recorded_at) <= cooldown_until:
                 continue
 
             severity = _score_to_severity(float(iso_score))
-            fault_type, fault_confidence = fault_classifier(record)
+            if rule_flag:
+                severity = AlertSeverity.CRITICAL if ml_flag else max(severity, AlertSeverity.MEDIUM, key=_SEVERITY_RANK.get)
 
             affected_metrics: dict[str, Any] = {
                 "top_contributors": _feature_contributions(x_raw, bundle),
@@ -735,6 +764,7 @@ class AnomalyService:
                     "lof_confirmed":          bool(lof_flagged),
                     "confidence":             "HIGH" if lof_flagged else "MEDIUM",
                     "n_features":             len(ALL_FEATURES),
+                    "trigger":                "ML+RULE" if ml_flag and rule_flag else "RULE" if rule_flag else "ML",
                     "n_train_samples":        bundle.n_train,
                     "model_version":          version.version if version else None,
                     "model_scope":            version.scope if version else None,

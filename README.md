@@ -49,7 +49,9 @@ graph TD
 
 A Redis lock keeps cycles single-flight across replicas, and every watermark lives in PostgreSQL, so restarts resume exactly where they stopped. The worker runs inside the API process by default, or separately with `python -m app.workers.runner`.
 
-**ML.** Models train on the most recent *clean* readings, meaning those before the scoring window that didn't raise an alert. Retraining happens when enough new data has arrived or the feature distribution drifts (PSI > 0.25), at most once an hour. Every version is stored HMAC-signed in `model_versions`, with Redis as a cache only. A tampered artifact is rejected before it is unpickled. Operators can **pin** a known-good model so a slowly degrading vehicle can't teach the detector that its degradation is normal. New vehicles are scored by a **class model** trained on their peers until they have history of their own.
+**ML.** Models train on the most recent *clean* readings, meaning those before the scoring window that didn't raise an alert. Retraining happens when enough new data has arrived or the feature distribution drifts (PSI > 0.25), at most once an hour. Every version is stored HMAC-signed in `model_versions`, with Redis as a cache only. A tampered artifact is rejected before it is unpickled. Operators can **pin** a known-good model so a slowly degrading vehicle can't teach the detector that its degradation is normal. New vehicles are scored by a **class model** trained on their peers until they have history of their own. A vehicle's very first batch only establishes its baseline, and while a model is young it retrains each time its clean history doubles, so a cold start can't define "normal".
+
+**Alerting.** A reading is abnormal when the Isolation Forest `decision_function` falls below `ANOMALY_SCORE_LOW` (0 is the contamination boundary; negative means outlier), **or** when a HIGH-confidence safety rule or OBD-II code fires. The rule path catches single-sensor faults, like a battery at 11.4 V, that barely move a 10-feature score. An alert is raised only when at least 3 of the last 5 readings are abnormal, so one-off sensor glitches are ignored, and then at most one per vehicle every 2 minutes.
 
 ---
 
@@ -150,7 +152,7 @@ All routes are under `/api/v1`. Full interactive docs are at `/docs`.
 
 ## Fault taxonomy
 
-Rules are evaluated in priority order after the ensemble flags a reading. An OBD-II trouble code in the reading outranks every sensor rule.
+The classifier names every alert. Its HIGH-confidence matches also raise alerts on their own (the safety-limit path above). Rules are evaluated in priority order, and an OBD-II trouble code outranks every sensor rule.
 
 | Fault | Signature |
 |---|---|

@@ -70,9 +70,13 @@ class Settings(BaseSettings):
     anomaly_retrain_min_interval_minutes: int = 60
     anomaly_drift_psi_threshold: float = 0.25
     anomaly_models_kept_per_device: int = 5
-    anomaly_score_low: float = -0.1
-    anomaly_score_medium: float = -0.3
-    anomaly_score_critical: float = -0.5
+    # IsolationForest decision_function thresholds: 0 = contamination boundary.
+    anomaly_score_low: float = -0.03
+    anomaly_score_medium: float = -0.08
+    anomaly_score_critical: float = -0.15
+    # Alert only if at least MIN of the last WINDOW readings are abnormal.
+    anomaly_persistence_window: int = 5
+    anomaly_persistence_min: int = 3
 
     # Trips, driver behaviour, fuel
     trip_gap_minutes: int = 5

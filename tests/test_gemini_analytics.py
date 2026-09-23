@@ -130,7 +130,7 @@ class TestGeminiServiceBuildPrompt:
         prompt = svc._build_prompt(
             device_type="truck",
             device_name="T",
-            anomaly_score=-0.6,  # below critical threshold -0.5
+            anomaly_score=-0.2,  # below the critical threshold (-0.15)
             affected_metrics={"top_contributors": [], "ensemble": {}},
         )
         assert "CRITICAL" in prompt
@@ -140,7 +140,7 @@ class TestGeminiServiceBuildPrompt:
         prompt = svc._build_prompt(
             device_type="truck",
             device_name="T",
-            anomaly_score=-0.35,  # between -0.3 and -0.5
+            anomaly_score=-0.10,  # between the MEDIUM (-0.08) and CRITICAL (-0.15) thresholds
             affected_metrics={"top_contributors": [], "ensemble": {}},
         )
         assert "MEDIUM" in prompt
