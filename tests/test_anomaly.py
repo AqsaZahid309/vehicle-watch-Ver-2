@@ -185,8 +185,29 @@ async def test_anomaly_service_anomalous_data(
     alert = alerts[0]
     assert alert.anomaly_score < 0              # IsolationForest outlier
     assert alert.device_id == seeded_device.id
-    assert alert.severity == AlertSeverity.CRITICAL   # ML outlier + safety-limit rule
-    assert alert.affected_metrics["ensemble"]["trigger"] == "ML+RULE"
+    assert alert.severity in (AlertSeverity.MEDIUM, AlertSeverity.CRITICAL)
+    # 30 training samples → model still learning, so the safety rules raised it
+    assert alert.affected_metrics["ensemble"]["trigger"] == "RULE"
+    assert alert.affected_metrics["ensemble"]["model_mature"] is False
+
+
+@pytest.mark.asyncio
+async def test_mature_model_raises_ml_only_alerts(db_session: AsyncSession, seeded_device: Device, monkeypatch) -> None:
+    """Once mature, a multivariate outlier with no rule match still alerts (trigger ML)."""
+    from datetime import timedelta
+    from app.services import anomaly_service
+    monkeypatch.setattr(anomaly_service.settings, "anomaly_mature_samples", 10)
+    now = datetime.now(timezone.utc)
+    for i in range(4):   # hot for this RPM, but under every hard limit
+        db_session.add(Telemetry(
+            id=uuid.uuid4(), device_id=seeded_device.id, recorded_at=now - timedelta(seconds=8 - 2 * i),
+            gps_lat=37.0, gps_lon=-122.0, engine_temp=108.0, rpm=750.0, fuel_level=60.0,
+            battery_voltage=13.2, speed=5.0, vibration=4.5,
+        ))
+    await db_session.flush()
+    alerts = await AnomalyService(db_session).run_for_device(seeded_device.id, since=now - timedelta(minutes=30))
+    assert len(alerts) == 1
+    assert alerts[0].affected_metrics["ensemble"]["trigger"] == "ML"
 
 
 @pytest.mark.asyncio

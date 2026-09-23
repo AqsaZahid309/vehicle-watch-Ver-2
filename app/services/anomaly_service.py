@@ -731,6 +731,13 @@ class AnomalyService:
         last_alert_ts = as_utc(await self._last_alert_time(device.id))
         cooldown_until = last_alert_ts + timedelta(seconds=DEDUPE_WINDOW_SECS) if last_alert_ts else None
 
+        # A young per-vehicle model (e.g. trained on a truck parked with a cold engine)
+        # sees ordinary driving as anomalous. Until it matures, only safety rules alert.
+        model_mature = (
+            (version is not None and (version.pinned or version.scope == "CLASS"))
+            or bundle.n_train >= settings.anomaly_mature_samples
+        )
+
         window = settings.anomaly_persistence_window
         needed = settings.anomaly_persistence_min
         recent: list[bool] = []
@@ -738,7 +745,7 @@ class AnomalyService:
         created_alerts: list[Alert] = []
         for record, iso_score, lof_flagged, x_raw in zip(new_records, iso_scores, lof_flags, X_new):
             fault_type, fault_confidence = fault_classifier(record)
-            ml_flag = iso_score < settings.anomaly_score_low
+            ml_flag = model_mature and iso_score < settings.anomaly_score_low
             # Safety limits: a HIGH-confidence rule (hard threshold or ECU trouble code)
             # is a fault even when the multivariate model finds the reading unremarkable —
             # e.g. a battery at 11.4 V moves one of ten features and barely shifts the score.
@@ -766,6 +773,7 @@ class AnomalyService:
                     "n_features":             len(ALL_FEATURES),
                     "trigger":                "ML+RULE" if ml_flag and rule_flag else "RULE" if rule_flag else "ML",
                     "n_train_samples":        bundle.n_train,
+                    "model_mature":           model_mature,
                     "model_version":          version.version if version else None,
                     "model_scope":            version.scope if version else None,
                 },

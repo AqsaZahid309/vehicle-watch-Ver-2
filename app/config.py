@@ -75,6 +75,9 @@ class Settings(BaseSettings):
     anomaly_score_medium: float = -0.08
     anomaly_score_critical: float = -0.15
     # Alert only if at least MIN of the last WINDOW readings are abnormal.
+    # Learning period: ML-only alerts are held back until a vehicle's model has this
+    # many training samples. Safety-limit / OBD-II alerts are never held back.
+    anomaly_mature_samples: int = 200
     anomaly_persistence_window: int = 5
     anomaly_persistence_min: int = 3
 
