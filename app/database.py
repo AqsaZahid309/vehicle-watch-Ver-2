@@ -13,14 +13,11 @@ settings = get_settings()
 
 # pool_pre_ping validates connections before use — avoids stale connection errors
 # after DB restarts or network interruptions.
-engine = create_async_engine(
-    settings.database_url,
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True,
-    pool_recycle=3600,
-    echo=not settings.is_production,
-)
+_engine_kwargs: dict = {"pool_pre_ping": True, "echo": settings.sql_echo}
+if not settings.database_url.startswith("sqlite"):
+    _engine_kwargs.update(pool_size=10, max_overflow=20, pool_recycle=3600)
+
+engine = create_async_engine(settings.database_url, **_engine_kwargs)
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,

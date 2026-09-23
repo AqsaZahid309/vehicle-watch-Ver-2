@@ -8,16 +8,17 @@ AnalyticsService tests use the existing db_session fixture (SQLite in-memory).
 
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.device import Device
 from app.models.telemetry import Telemetry
-from app.models.user import User, UserRole
+from app.models.user import UserRole
 from app.services.analytics_service import AnalyticsService
 from app.services.gemini_service import GeminiService
+from tests.conftest import make_device, make_org, make_user
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared test data
@@ -146,7 +147,8 @@ class TestGeminiServiceBuildPrompt:
 
     def test_prompt_different_fault_types(self) -> None:
         svc = self._svc()
-        for fault in ["BATTERY_FAILURE", "TRANSMISSION_STRESS", "BRAKE_WEAR", "ENGINE_STRESS"]:
+        for fault in ["BATTERY_FAILURE", "TRANSMISSION_STRESS", "BRAKE_WEAR", "ENGINE_STRESS",
+                      "WHEEL_BEARING", "LOW_OIL_PRESSURE", "TIRE_PRESSURE"]:
             prompt = svc._build_prompt(
                 device_type="truck",
                 device_name="T",
@@ -216,15 +218,28 @@ class TestGeminiServiceGenerate:
         assert isinstance(result, str)
         assert len(result) > 10
 
+    @staticmethod
+    def _mock_client(text: str | None = None, error: Exception | None = None) -> MagicMock:
+        client = MagicMock()
+        if error is not None:
+            client.aio.models.generate_content = AsyncMock(side_effect=error)
+        else:
+            resp = MagicMock()
+            resp.text = text
+            client.aio.models.generate_content = AsyncMock(return_value=resp)
+        return client
+
+    def _svc_with(self, client: MagicMock) -> GeminiService:
+        svc = GeminiService.__new__(GeminiService)
+        svc._client = client
+        svc._model = "gemini-flash-latest"
+        return svc
+
     @pytest.mark.asyncio
     async def test_mocked_client_returns_response_text(self) -> None:
-        """When _client is set, generate_content is called and text is returned."""
-        svc = GeminiService.__new__(GeminiService)
-        mock_resp = MagicMock()
-        mock_resp.text = "Truck-Beta shows COOLANT_LEAK with HIGH confidence."
-        mock_client = MagicMock()
-        mock_client.generate_content.return_value = mock_resp
-        svc._client = mock_client
+        """When _client is set, the async generate_content is called and text is returned."""
+        mock_client = self._mock_client("Truck-Beta shows COOLANT_LEAK with HIGH confidence.")
+        svc = self._svc_with(mock_client)
 
         result = await svc.generate_alert_summary(
             device_type="truck",
@@ -235,15 +250,22 @@ class TestGeminiServiceGenerate:
             fault_confidence="HIGH",
         )
         assert result == "Truck-Beta shows COOLANT_LEAK with HIGH confidence."
-        assert mock_client.generate_content.call_count == 1
+        assert mock_client.aio.models.generate_content.await_count == 1
+        assert mock_client.aio.models.generate_content.call_args.kwargs["model"] == "gemini-flash-latest"
+
+    @pytest.mark.asyncio
+    async def test_empty_response_falls_back(self) -> None:
+        svc = self._svc_with(self._mock_client(""))
+        result = await svc.generate_alert_summary(
+            device_type="truck", device_name="T", anomaly_score=-0.4,
+            affected_metrics=_SAMPLE_METRICS, fault_type="COOLANT_LEAK", fault_confidence="HIGH",
+        )
+        assert "COOLANT_LEAK" in result
 
     @pytest.mark.asyncio
     async def test_mocked_client_exception_falls_back(self) -> None:
         """If generate_content raises, the fallback summary is returned."""
-        svc = GeminiService.__new__(GeminiService)
-        mock_client = MagicMock()
-        mock_client.generate_content.side_effect = RuntimeError("API error")
-        svc._client = mock_client
+        svc = self._svc_with(self._mock_client(error=RuntimeError("API error")))
 
         result = await svc.generate_alert_summary(
             device_type="truck",
@@ -257,12 +279,8 @@ class TestGeminiServiceGenerate:
     @pytest.mark.asyncio
     async def test_prompt_is_passed_to_client(self) -> None:
         """The prompt built by _build_prompt is forwarded to generate_content."""
-        svc = GeminiService.__new__(GeminiService)
-        mock_resp = MagicMock()
-        mock_resp.text = "response"
-        mock_client = MagicMock()
-        mock_client.generate_content.return_value = mock_resp
-        svc._client = mock_client
+        mock_client = self._mock_client("response")
+        svc = self._svc_with(mock_client)
 
         await svc.generate_alert_summary(
             device_type="truck",
@@ -272,8 +290,7 @@ class TestGeminiServiceGenerate:
             fault_type="ENGINE_STRESS",
             fault_confidence="HIGH",
         )
-        call_args = mock_client.generate_content.call_args
-        prompt_sent = call_args[0][0]
+        prompt_sent = mock_client.aio.models.generate_content.call_args.kwargs["contents"]
         assert "Truck-Alpha" in prompt_sent
         assert "ENGINE_STRESS" in prompt_sent
 
@@ -283,35 +300,17 @@ class TestGeminiServiceGenerate:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-async def _make_user(db: AsyncSession, email: str, role: UserRole = UserRole.OPERATOR) -> User:
-    user = User(
-        id=uuid.uuid4(),
-        email=email,
-        hashed_password="hashed",
-        role=role,
-    )
-    db.add(user)
-    await db.flush()
-    return user
+async def _org_admin(db: AsyncSession, email: str) -> tuple:
+    org = await make_org(db, email)
+    return org, await make_user(db, org, email, UserRole.ADMIN)
 
 
-async def _make_device(db: AsyncSession, owner: User, name: str = "Test Truck") -> Device:
-    device = Device(
-        id=uuid.uuid4(),
-        name=name,
-        device_type="truck",
-        owner_id=owner.id,
-    )
-    db.add(device)
-    await db.flush()
-    return device
-
-
-async def _make_telemetry(db: AsyncSession, device: Device) -> Telemetry:
+async def _make_telemetry(db: AsyncSession, device: Device, offset_s: int = 0) -> Telemetry:
+    from datetime import timedelta
     record = Telemetry(
         id=uuid.uuid4(),
         device_id=device.id,
-        recorded_at=datetime.now(timezone.utc),
+        recorded_at=datetime.now(timezone.utc) - timedelta(seconds=offset_s),
         gps_lat=37.0,
         gps_lon=-122.0,
         engine_temp=87.0,
@@ -328,10 +327,9 @@ async def _make_telemetry(db: AsyncSession, device: Device) -> Telemetry:
 
 @pytest.mark.asyncio
 async def test_fleet_summary_empty(db_session: AsyncSession) -> None:
-    """Operator with no devices gets zero-filled response."""
-    user = await _make_user(db_session, "empty@test.com")
-    svc = AnalyticsService(db_session)
-    result = await svc.fleet_summary(user)
+    """An organization with no devices gets a zero-filled response."""
+    _, user = await _org_admin(db_session, "empty@test.com")
+    result = await AnalyticsService(db_session).fleet_summary(user)
     assert result["total_devices"] == 0
     assert result["active_devices"] == 0
     assert result["total_alerts"] == 0
@@ -340,56 +338,44 @@ async def test_fleet_summary_empty(db_session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
-async def test_fleet_summary_operator_sees_own_devices(db_session: AsyncSession) -> None:
-    """Operator only sees their own device."""
-    op = await _make_user(db_session, "op@test.com", UserRole.OPERATOR)
-    other = await _make_user(db_session, "other@test.com", UserRole.OPERATOR)
-    await _make_device(db_session, op, "My Truck")
-    await _make_device(db_session, other, "Other Truck")
-
-    svc = AnalyticsService(db_session)
-    result = await svc.fleet_summary(op)
+async def test_fleet_summary_is_scoped_to_organization(db_session: AsyncSession) -> None:
+    """Users only ever see their own organization's vehicles."""
+    org_a, user_a = await _org_admin(db_session, "a@test.com")
+    org_b, _ = await _org_admin(db_session, "b@test.com")
+    await make_device(db_session, org_a, name="Mine")
+    await make_device(db_session, org_b, name="Theirs")
+    await make_device(db_session, org_b, name="Theirs 2")
+    result = await AnalyticsService(db_session).fleet_summary(user_a)
     assert result["total_devices"] == 1
 
 
 @pytest.mark.asyncio
-async def test_fleet_summary_admin_sees_all_devices(db_session: AsyncSession) -> None:
-    """Admin sees all devices regardless of owner."""
-    admin = await _make_user(db_session, "admin_a@test.com", UserRole.ADMIN)
-    op1 = await _make_user(db_session, "op1_a@test.com", UserRole.OPERATOR)
-    op2 = await _make_user(db_session, "op2_a@test.com", UserRole.OPERATOR)
-    await _make_device(db_session, op1, "T1")
-    await _make_device(db_session, op2, "T2")
-
-    svc = AnalyticsService(db_session)
-    result = await svc.fleet_summary(admin)
-    assert result["total_devices"] >= 2
+async def test_fleet_summary_all_roles_see_whole_org(db_session: AsyncSession) -> None:
+    org, _ = await _org_admin(db_session, "admin_a@test.com")
+    viewer = await make_user(db_session, org, "viewer_a@test.com", UserRole.VIEWER)
+    await make_device(db_session, org, name="T1")
+    await make_device(db_session, org, name="T2")
+    result = await AnalyticsService(db_session).fleet_summary(viewer)
+    assert result["total_devices"] == 2
 
 
 @pytest.mark.asyncio
 async def test_fleet_summary_active_count(db_session: AsyncSession) -> None:
-    """active_devices counts only devices with is_active=True."""
-    admin = await _make_user(db_session, "admin_b@test.com", UserRole.ADMIN)
-    dev_active = await _make_device(db_session, admin, "Active")
-    dev_inactive = await _make_device(db_session, admin, "Inactive")
-    dev_inactive.is_active = False
+    org, admin = await _org_admin(db_session, "admin_b@test.com")
+    await make_device(db_session, org, name="Active")
+    inactive = await make_device(db_session, org, name="Inactive")
+    inactive.is_active = False
     await db_session.flush()
-
-    svc = AnalyticsService(db_session)
-    result = await svc.fleet_summary(admin)
-    # At least one active device (dev_active) and one inactive (dev_inactive)
+    result = await AnalyticsService(db_session).fleet_summary(admin)
     assert result["active_devices"] < result["total_devices"]
 
 
 @pytest.mark.asyncio
 async def test_fleet_summary_with_telemetry_averages(db_session: AsyncSession) -> None:
-    """avg_engine_temp and avg_fuel_level are computed from telemetry."""
-    admin = await _make_user(db_session, "admin_c@test.com", UserRole.ADMIN)
-    dev = await _make_device(db_session, admin, "TelTruck")
+    org, admin = await _org_admin(db_session, "admin_c@test.com")
+    dev = await make_device(db_session, org, name="TelTruck")
     await _make_telemetry(db_session, dev)
-
-    svc = AnalyticsService(db_session)
-    result = await svc.fleet_summary(admin)
+    result = await AnalyticsService(db_session).fleet_summary(admin)
     assert result["avg_engine_temp"] is not None
     assert result["avg_fuel_level"] is not None
     assert 0 < result["avg_engine_temp"] < 200
@@ -397,37 +383,30 @@ async def test_fleet_summary_with_telemetry_averages(db_session: AsyncSession) -
 
 @pytest.mark.asyncio
 async def test_device_trends_not_found(db_session: AsyncSession) -> None:
-    """Requesting trends for a non-existent device raises NotFoundError."""
     from app.core.exceptions import NotFoundError
 
-    admin = await _make_user(db_session, "admin_d@test.com", UserRole.ADMIN)
-    svc = AnalyticsService(db_session)
+    _, admin = await _org_admin(db_session, "admin_d@test.com")
     with pytest.raises(NotFoundError):
-        await svc.device_trends(uuid.uuid4(), admin)
+        await AnalyticsService(db_session).device_trends(uuid.uuid4(), admin)
 
 
 @pytest.mark.asyncio
-async def test_device_trends_forbidden(db_session: AsyncSession) -> None:
-    """An operator cannot view another user's device trends."""
-    from app.core.exceptions import ForbiddenError
+async def test_device_trends_other_org_not_found(db_session: AsyncSession) -> None:
+    """Cross-tenant access is a 404, not a 403 — don't confirm the device exists."""
+    from app.core.exceptions import NotFoundError
 
-    owner = await _make_user(db_session, "owner@test.com", UserRole.OPERATOR)
-    stranger = await _make_user(db_session, "stranger@test.com", UserRole.OPERATOR)
-    dev = await _make_device(db_session, owner, "Owned Truck")
-
-    svc = AnalyticsService(db_session)
-    with pytest.raises(ForbiddenError):
-        await svc.device_trends(dev.id, stranger)
+    org_a, _ = await _org_admin(db_session, "owner@test.com")
+    _, stranger = await _org_admin(db_session, "stranger@test.com")
+    dev = await make_device(db_session, org_a, name="Owned Truck")
+    with pytest.raises(NotFoundError):
+        await AnalyticsService(db_session).device_trends(dev.id, stranger)
 
 
 @pytest.mark.asyncio
 async def test_device_trends_no_telemetry(db_session: AsyncSession) -> None:
-    """Device trends with no telemetry returns empty trends dict."""
-    admin = await _make_user(db_session, "admin_e@test.com", UserRole.ADMIN)
-    dev = await _make_device(db_session, admin, "Empty Truck")
-
-    svc = AnalyticsService(db_session)
-    result = await svc.device_trends(dev.id, admin)
+    org, admin = await _org_admin(db_session, "admin_e@test.com")
+    dev = await make_device(db_session, org, name="Empty Truck")
+    result = await AnalyticsService(db_session).device_trends(dev.id, admin)
     assert result["sample_count"] == 0
     assert result["trends"] == {}
     assert result["device_id"] == str(dev.id)
@@ -435,19 +414,20 @@ async def test_device_trends_no_telemetry(db_session: AsyncSession) -> None:
 
 @pytest.mark.asyncio
 async def test_device_trends_with_telemetry(db_session: AsyncSession) -> None:
-    """Device trends with data returns min/max/avg/latest per field."""
-    admin = await _make_user(db_session, "admin_f@test.com", UserRole.ADMIN)
-    dev = await _make_device(db_session, admin, "Data Truck")
-    await _make_telemetry(db_session, dev)
-    await _make_telemetry(db_session, dev)
-
-    svc = AnalyticsService(db_session)
-    result = await svc.device_trends(dev.id, admin)
+    org, admin = await _org_admin(db_session, "admin_f@test.com")
+    dev = await make_device(db_session, org, name="Data Truck")
+    await _make_telemetry(db_session, dev, 2)
+    await _make_telemetry(db_session, dev, 0)
+    result = await AnalyticsService(db_session).device_trends(dev.id, admin)
     assert result["sample_count"] == 2
-    assert "engine_temp" in result["trends"]
     trend = result["trends"]["engine_temp"]
-    assert "min" in trend
-    assert "max" in trend
-    assert "avg" in trend
-    assert "latest" in trend
     assert trend["min"] <= trend["avg"] <= trend["max"]
+    assert len(result["series"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_alert_timeline_shape(db_session: AsyncSession) -> None:
+    _, admin = await _org_admin(db_session, "admin_g@test.com")
+    rows = await AnalyticsService(db_session).alert_timeline(admin, days=7)
+    assert len(rows) == 8
+    assert set(rows[0]) == {"date", "LOW", "MEDIUM", "CRITICAL"}

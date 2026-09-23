@@ -40,24 +40,34 @@ return 1
 """
 
 
+async def _check(key: str, redis: aioredis.Redis, limit: int, window: int) -> None:
+    now_ms = int(time.time() * 1000)
+    member = str(_uuid_mod.uuid4())  # unique per request — fixes ZADD collision bug
+    result = await redis.eval(RATE_LIMIT_SCRIPT, 1, key, now_ms, window, limit, member)
+    if result == 0:
+        raise RateLimitError(retry_after=window)
+
+
 async def check_device_rate_limit(device_id: str, redis: aioredis.Redis) -> None:
     """
     Raises RateLimitError if the device has exceeded its request quota.
     Atomic Lua script prevents race conditions without MULTI/EXEC overhead.
+    A batch upload counts once per request, not per reading — offline buffers
+    must be able to drain in one go.
     """
-    key = f"ratelimit:device:{device_id}"
-    now_ms = int(time.time() * 1000)
-    member = str(_uuid_mod.uuid4())  # unique per request — fixes ZADD collision bug
-
-    result = await redis.eval(
-        RATE_LIMIT_SCRIPT,
-        1,
-        key,
-        now_ms,
-        settings.rate_limit_window_seconds,
+    await _check(
+        f"ratelimit:device:{device_id}",
+        redis,
         settings.rate_limit_requests,
-        member,
+        settings.rate_limit_window_seconds,
     )
 
-    if result == 0:
-        raise RateLimitError(retry_after=settings.rate_limit_window_seconds)
+
+async def check_login_rate_limit(client_key: str, redis: aioredis.Redis) -> None:
+    """Throttle credential guessing per client IP + email."""
+    await _check(
+        f"ratelimit:login:{client_key}",
+        redis,
+        settings.login_rate_limit_requests,
+        settings.login_rate_limit_window_seconds,
+    )

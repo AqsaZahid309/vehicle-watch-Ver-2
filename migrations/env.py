@@ -10,7 +10,7 @@ from app.config import get_settings
 from app.database import Base
 
 # Import all models so Alembic can detect schema changes
-from app.models import User, Device, Telemetry, Alert  # noqa: F401
+import app.models  # noqa: F401  (registers every model on Base.metadata)
 
 config = context.config
 settings = get_settings()

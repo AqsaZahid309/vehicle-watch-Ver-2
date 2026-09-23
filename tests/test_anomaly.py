@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.device import Device
 from app.models.telemetry import Telemetry
-from app.models.user import User, UserRole
+from tests.conftest import make_device, make_org, make_user
 from app.services.anomaly_service import (
     AnomalyService,
     NORMAL_RANGES,
@@ -77,22 +77,9 @@ async def seeded_device(db_session: AsyncSession):
     from datetime import timedelta
     random.seed(42)
 
-    user = User(
-        id=uuid.uuid4(),
-        email="anomaly_test@test.com",
-        hashed_password="hashed",
-        role=UserRole.ADMIN,
-    )
-    db_session.add(user)
-
-    device = Device(
-        id=uuid.uuid4(),
-        name="Test Device",
-        device_type="truck",
-        owner_id=user.id,
-    )
-    db_session.add(device)
-    await db_session.flush()
+    org = await make_org(db_session)
+    user = await make_user(db_session, org, "anomaly_test@test.com")
+    device = await make_device(db_session, org, user, name="Test Device")
 
     baseline_time = datetime.now(timezone.utc) - timedelta(hours=1)
 

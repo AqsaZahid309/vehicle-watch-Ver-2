@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sys
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator
@@ -15,157 +16,167 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger(__name__)
-logger.info("VehicleWatch: module import phase starting")
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, Request  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest  # noqa: E402
 
-logger.info("VehicleWatch: FastAPI imported OK")
-
-from app.config import get_settings
-
-logger.info("VehicleWatch: config imported OK")
-
-from app.core.exceptions import register_exception_handlers
-from app.database import engine
-from app.redis import init_redis, close_redis, get_redis_pool
-from app.routers import auth, devices, telemetry, alerts, analytics
-from app.workers.anomaly_worker import start_anomaly_worker
-
-logger.info("VehicleWatch: all internal imports OK")
-
-STATIC_DIR = Path(__file__).parent / "static"
-settings = get_settings()
-logger.info(
-    "VehicleWatch: settings loaded [env=%s, db_url_prefix=%s]",
-    settings.app_env,
-    str(settings.database_url)[:30],
+from app.config import get_settings  # noqa: E402
+from app.core.exceptions import register_exception_handlers  # noqa: E402
+from app.core.metrics import MetricsMiddleware  # noqa: E402
+from app.database import engine  # noqa: E402
+from app.redis import init_redis, close_redis, get_redis_pool  # noqa: E402
+from app.routers import (  # noqa: E402
+    alerts, analytics, auth, devices, fleet, maintenance, ml, notifications, reports, stream,
+    telemetry, users,
 )
+from app.workers.anomaly_worker import start_anomaly_worker  # noqa: E402
+
+VERSION = "2.0.0"
+STATIC_DIR = Path(__file__).parent / "static"
+SPA_DIR = STATIC_DIR / "app"          # built frontend (frontend/ → npm run build)
+settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    logger.info("=== Lifespan startup BEGIN [env=%s] ===", settings.app_env)
+    logger.info("=== VehicleWatch %s starting [env=%s] ===", VERSION, settings.app_env)
+    await init_redis()
+    logger.info("Redis pools initialised")
 
-    # ── Step 1: Redis ─────────────────────────────────────────────────────────
-    logger.info("Lifespan step 1/2 — initialising Redis connection pool...")
-    try:
-        await init_redis()
-        logger.info("Lifespan step 1/2 — Redis OK")
-    except Exception as exc:
-        logger.error(
-            "Lifespan step 1/2 — Redis FAILED: %s", exc, exc_info=True
-        )
-        raise
-
-    # ── Step 2: Anomaly worker ────────────────────────────────────────────────
-    logger.info("Lifespan step 2/2 — starting anomaly detection worker task...")
-    try:
+    worker_task: asyncio.Task | None = None
+    if settings.run_worker_in_api:
         worker_task = asyncio.create_task(start_anomaly_worker())
-        logger.info("Lifespan step 2/2 — anomaly worker task created OK")
-    except Exception as exc:
-        logger.error(
-            "Lifespan step 2/2 — anomaly worker FAILED: %s", exc, exc_info=True
-        )
-        raise
+        logger.info("Background worker running in-process (RUN_WORKER_IN_API=true)")
+    else:
+        logger.info("Background worker disabled here — run `python -m app.workers.runner`")
 
-    logger.info("=== Lifespan startup COMPLETE — app is accepting requests ===")
     yield
 
-    # ── Shutdown ──────────────────────────────────────────────────────────────
-    logger.info("=== Lifespan shutdown BEGIN ===")
-    worker_task.cancel()
-    try:
-        await worker_task
-    except asyncio.CancelledError:
-        pass
+    logger.info("=== Shutdown ===")
+    if worker_task is not None:
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
     await close_redis()
     await engine.dispose()
-    logger.info("=== Lifespan shutdown COMPLETE ===")
 
 
 app = FastAPI(
     title="VehicleWatch",
-    description="Real-Time Fleet Telemetry Ingestion and ML Anomaly Detection API",
-    version="1.0.0",
+    description=(
+        "Fleet telemetry, predictive maintenance and operations platform: ML anomaly detection, "
+        "failure forecasting, work orders, trips & driver scoring, geofencing, fuel analytics, "
+        "notifications and reporting."
+    ),
+    version=VERSION,
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
-# ── /health registered FIRST — must return 200 regardless of DB/Redis state.
-# Railway healthcheck polls this immediately on container start; if it has any
-# dependency (DB connect, Redis ping) it will fail during lifespan startup and
-# keep the container in a crash loop before the services are even ready.
+
+# /health registered FIRST and dependency-free — the platform healthcheck polls it
+# during startup, before DB/Redis may be reachable.
 @app.get("/health", tags=["Health"])
 async def health() -> dict:
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": VERSION}
 
 
-# ── CORS ─────────────────────────────────────────────────────────────────────
-# allow_credentials=True is incompatible with allow_origins=["*"].
-# In development we allow localhost origins explicitly.
-# In production, set ALLOWED_ORIGINS env var to your frontend domain.
-_dev_origins = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://localhost:8000",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:8000",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_dev_origins if not settings.is_production else settings.allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-register_exception_handlers(app)
-
-API_PREFIX = "/api/v1"
-app.include_router(auth.router,      prefix=API_PREFIX)
-app.include_router(devices.router,   prefix=API_PREFIX)
-app.include_router(telemetry.router, prefix=API_PREFIX)
-app.include_router(alerts.router,    prefix=API_PREFIX)
-app.include_router(analytics.router, prefix=API_PREFIX)
-
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-
-@app.get("/dashboard", include_in_schema=False)
-async def dashboard() -> FileResponse:
-    return FileResponse(STATIC_DIR / "dashboard.html")
-
-
-# ── Deep health check (separate from the lightweight /health above) ───────────
 @app.get("/health/deep", tags=["Health"])
 async def health_deep() -> dict:
-    """
-    Verifies DB and Redis are reachable.
-    Use this for manual diagnostics — NOT as the Railway healthcheck path.
-    """
+    """Verifies DB and Redis are reachable. For diagnostics, not the platform healthcheck."""
     from sqlalchemy import text
 
-    result: dict = {"status": "ok", "version": "1.0.0", "services": {}}
-
+    result: dict = {"status": "ok", "version": VERSION, "services": {}}
     try:
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
         result["services"]["postgres"] = "ok"
     except Exception as exc:
-        result["services"]["postgres"] = f"error: {exc}"
+        result["services"]["postgres"] = f"error: {type(exc).__name__}"
         result["status"] = "degraded"
-
     try:
-        redis = get_redis_pool()
-        await redis.ping()
+        await get_redis_pool().ping()
         result["services"]["redis"] = "ok"
     except Exception as exc:
-        result["services"]["redis"] = f"error: {exc}"
+        result["services"]["redis"] = f"error: {type(exc).__name__}"
         result["status"] = "degraded"
-
     return result
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics(request: Request) -> Response:
+    if settings.metrics_token:
+        if request.headers.get("authorization") != f"Bearer {settings.metrics_token}":
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# ── Middleware ───────────────────────────────────────────────────────────────
+_dev_origins = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:8000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:8000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins if settings.is_production else _dev_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(MetricsMiddleware)
+
+
+@app.middleware("http")
+async def request_id_and_security_headers(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    return response
+
+
+register_exception_handlers(app)
+
+API_PREFIX = "/api/v1"
+for r in (auth, users, devices, telemetry, alerts, analytics, maintenance, fleet,
+          notifications, ml, reports, stream):
+    app.include_router(r.router, prefix=API_PREFIX)
+
+
+# ── Frontend (single-page app) ───────────────────────────────────────────────
+if (SPA_DIR / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=SPA_DIR / "assets"), name="assets")
+
+
+@app.get("/dashboard", include_in_schema=False)
+async def legacy_dashboard() -> RedirectResponse:
+    return RedirectResponse("/", status_code=308)
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def spa(full_path: str) -> Response:
+    """Serve the SPA for every non-API route so client-side routing and deep links work."""
+    if full_path.startswith(("api/", "docs", "redoc", "openapi.json")):
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
+    candidate = (SPA_DIR / full_path).resolve()
+    if full_path and candidate.is_file() and SPA_DIR.resolve() in candidate.parents:
+        return FileResponse(candidate)
+    index = SPA_DIR / "index.html"
+    if index.is_file():
+        return FileResponse(index, headers={"Cache-Control": "no-cache"})
+    return JSONResponse(
+        {"detail": "Frontend not built. Run `npm ci && npm run build` in frontend/, or use the API at /docs."},
+        status_code=404,
+    )

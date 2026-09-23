@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 import enum
 
-from sqlalchemy import Float, DateTime, ForeignKey, Boolean, Text, Enum as SAEnum, JSON
+from sqlalchemy import Float, DateTime, ForeignKey, Boolean, String, Text, Enum as SAEnum, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
@@ -16,12 +16,15 @@ class AlertSeverity(str, enum.Enum):
 
 
 class FaultType(str, enum.Enum):
-    """Named fault taxonomy derived from sensor pattern matching."""
+    """Named fault taxonomy derived from sensor pattern matching and OBD-II codes."""
     COOLANT_LEAK        = "COOLANT_LEAK"
     BATTERY_FAILURE     = "BATTERY_FAILURE"
     TRANSMISSION_STRESS = "TRANSMISSION_STRESS"
     BRAKE_WEAR          = "BRAKE_WEAR"
     ENGINE_STRESS       = "ENGINE_STRESS"
+    WHEEL_BEARING       = "WHEEL_BEARING"
+    LOW_OIL_PRESSURE    = "LOW_OIL_PRESSURE"
+    TIRE_PRESSURE       = "TIRE_PRESSURE"
     UNKNOWN_ANOMALY     = "UNKNOWN_ANOMALY"
 
 
@@ -29,6 +32,12 @@ class FaultConfidence(str, enum.Enum):
     """Confidence level of the fault classification."""
     HIGH   = "HIGH"
     MEDIUM = "MEDIUM"
+
+
+class AlertFeedback(str, enum.Enum):
+    """Operator / technician verdict — the labels that measure detector precision."""
+    TRUE_POSITIVE  = "TRUE_POSITIVE"
+    FALSE_POSITIVE = "FALSE_POSITIVE"
 
 
 class Alert(Base):
@@ -67,10 +76,23 @@ class Alert(Base):
     )
     llm_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     acknowledged: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    acknowledged_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # Feedback loop — set explicitly by a user, or automatically when a linked
+    # work order is resolved with a confirmed root cause.
+    feedback: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    feedback_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    feedback_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
+        index=True,
     )
 
     device: Mapped["Device"] = relationship("Device", back_populates="alerts")  # type: ignore[name-defined]

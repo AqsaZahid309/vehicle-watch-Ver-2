@@ -1,10 +1,15 @@
 """
 Gemini LLM integration for human-readable anomaly summaries.
 
-We call Gemini asynchronously using run_in_executor to wrap the synchronous
-google-generativeai SDK — the SDK does not have native async support.
-Failures are caught and logged rather than raised, so an LLM outage
-never blocks alert creation.
+Uses the `google-genai` SDK (the successor to the deprecated
+`google-generativeai` package) through its native async client. The model is
+configurable via GEMINI_MODEL and defaults to Google's rolling
+"gemini-flash-latest" alias, so retiring a pinned model version does not
+silently break summaries again.
+
+Failures are caught and logged rather than raised, so an LLM outage never
+blocks alert creation. The worker calls this *after* alerts are committed,
+so a slow LLM never holds a database transaction open.
 """
 
 import asyncio
@@ -12,6 +17,7 @@ import logging
 from typing import Any
 
 from app.config import get_settings
+from app.core.metrics import LLM_REQUESTS
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -39,9 +45,27 @@ _FAULT_PLAYBOOKS: dict[str, str] = {
     ),
     "BRAKE_WEAR": (
         "Inspect all brake pads and rotors for wear thickness (minimum: 3 mm pad, 20 mm rotor). "
-        "Check wheel bearings for play by lifting each wheel and testing for wobble. "
-        "Listen for grinding or humming noise at speed — indicates metal-on-metal contact. "
-        "Do not operate at highway speed until brakes and bearings are inspected."
+        "Check brake fluid level and ABS sensor wiring for the reported chassis code. "
+        "Listen for grinding noise under braking — indicates metal-on-metal contact. "
+        "Restrict the vehicle to low-speed duty until the brakes are inspected."
+    ),
+    "WHEEL_BEARING": (
+        "Lift each axle and check wheel bearings for play, roughness or heat. "
+        "Listen for a humming or growling noise that rises with road speed. "
+        "Check hub nut torque and the condition of the wheel-speed sensor. "
+        "Do not operate at highway speed until the bearing is inspected — a seized bearing can detach a wheel."
+    ),
+    "LOW_OIL_PRESSURE": (
+        "Stop the engine as soon as it is safe — running with low oil pressure destroys bearings within minutes. "
+        "Check the oil level on the dipstick and look for leaks under the engine. "
+        "Verify the reading with a mechanical gauge to rule out a faulty sender. "
+        "Inspect the oil pump and pickup screen if the level is correct."
+    ),
+    "TIRE_PRESSURE": (
+        "Inspect the affected tyre for punctures, sidewall damage or a leaking valve. "
+        "Inflate to the manufacturer's cold pressure and re-check after 30 minutes. "
+        "Check the TPMS sensor if pressure is correct but the warning persists. "
+        "Under-inflated heavy-vehicle tyres overheat and can blow out — do not run on them at speed."
     ),
     "ENGINE_STRESS": (
         "Check engine oil level and condition immediately — low or degraded oil causes thermal runaway. "
@@ -67,17 +91,37 @@ class GeminiService:
 
     def __init__(self) -> None:
         self._client = None
+        self._model = settings.gemini_model
         if settings.gemini_api_key:
             try:
-                import google.generativeai as genai
+                from google import genai
 
-                genai.configure(api_key=settings.gemini_api_key)
-                self._client = genai.GenerativeModel("gemini-1.5-flash")
-                logger.info("Gemini client initialized (model: gemini-1.5-flash)")
+                self._client = genai.Client(api_key=settings.gemini_api_key)
+                logger.info("Gemini client initialized (model: %s)", self._model)
             except ImportError:
-                logger.warning("google-generativeai not installed; LLM summaries disabled")
+                logger.warning("google-genai not installed; LLM summaries disabled")
         else:
             logger.info("GEMINI_API_KEY not set; LLM summaries will use fallback text")
+
+    @property
+    def enabled(self) -> bool:
+        return self._client is not None
+
+    async def _generate(self, prompt: str) -> str:
+        from google.genai import types
+
+        response = await asyncio.wait_for(
+            self._client.aio.models.generate_content(
+                model=self._model,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.3, max_output_tokens=400),
+            ),
+            timeout=settings.gemini_timeout_seconds,
+        )
+        text = (response.text or "").strip()
+        if not text:
+            raise ValueError("Empty response from Gemini")
+        return text
 
     def _build_prompt(
         self,
@@ -209,14 +253,11 @@ class GeminiService:
         )
 
         try:
-            # Use get_running_loop() — get_event_loop() is deprecated in Python 3.10+
-            # and raises DeprecationWarning when called inside a running coroutine.
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None, lambda: self._client.generate_content(prompt)
-            )
-            return response.text.strip()
+            text = await self._generate(prompt)
+            LLM_REQUESTS.labels("ok").inc()
+            return text
         except Exception as exc:
+            LLM_REQUESTS.labels("error").inc()
             logger.warning("Gemini API call failed: %s — using fallback summary", exc)
             return self._fallback_summary(
                 device_type, affected_metrics, fault_type, fault_confidence
